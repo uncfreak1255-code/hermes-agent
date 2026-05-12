@@ -528,6 +528,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
+                # Discord is connected at this point. Slash command sync can
+                # be slow or rate-limited, but it should not make startup fail.
+                adapter_self._ready_event.set()
                 
                 # Sync slash commands with Discord
                 try:
@@ -535,7 +538,6 @@ class DiscordAdapter(BasePlatformAdapter):
                     logger.info("[%s] Synced %d slash command(s)", adapter_self.name, len(synced))
                 except Exception as e:  # pragma: no cover - defensive logging
                     logger.warning("[%s] Slash command sync failed: %s", adapter_self.name, e, exc_info=True)
-                adapter_self._ready_event.set()
             
             @self._client.event
             async def on_message(message: DiscordMessage):
