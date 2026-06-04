@@ -1270,6 +1270,41 @@ class TestRunJobSessionPersistence:
         assert call_args[0][1] is False  # success should be False
         assert "empty" in call_args[0][2].lower()  # error should mention empty
 
+    def test_tick_auto_pauses_job_when_script_is_missing(self, tmp_path):
+        """Missing configured scripts should pause the job after the first failure."""
+        from cron.scheduler import tick
+
+        job = {
+            "id": "missing-script-job",
+            "name": "missing-script",
+            "prompt": "",
+            "script": "missing.py",
+            "schedule": "every 1h",
+            "enabled": True,
+            "next_run_at": "2020-01-01T00:00:00",
+            "deliver": "local",
+            "last_status": None,
+        }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch(
+                 "cron.scheduler.run_job",
+                 return_value=(False, "output", "", "Script not found: /tmp/missing.py"),
+             ), \
+             patch("cron.jobs.pause_job") as mock_pause, \
+             patch("cron.scheduler.mark_job_run") as mock_mark:
+            tick(verbose=False)
+
+        mock_pause.assert_called_once()
+        assert mock_pause.call_args.args[0] == "missing-script-job"
+        marked_error = mock_mark.call_args.args[2]
+        assert "script not found" in marked_error.lower()
+        assert "auto-paused" in marked_error.lower()
+
     def test_run_job_sets_auto_delivery_env_from_dotenv_home_channel(self, tmp_path, monkeypatch):
         job = {
             "id": "test-job",

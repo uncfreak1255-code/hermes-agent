@@ -47,15 +47,17 @@ class TestJobScriptField:
     def test_create_job_with_script(self, cron_env):
         from cron.jobs import create_job, get_job
 
+        script = cron_env / "scripts" / "monitor.py"
+        script.write_text('print("ok")\n')
         job = create_job(
             prompt="Analyze the data",
             schedule="every 30m",
-            script="/path/to/monitor.py",
+            script="monitor.py",
         )
-        assert job["script"] == "/path/to/monitor.py"
+        assert job["script"] == "monitor.py"
 
         loaded = get_job(job["id"])
-        assert loaded["script"] == "/path/to/monitor.py"
+        assert loaded["script"] == "monitor.py"
 
     def test_create_job_without_script(self, cron_env):
         from cron.jobs import create_job
@@ -75,17 +77,27 @@ class TestJobScriptField:
         job = create_job(prompt="Hello", schedule="every 1h")
         assert job.get("script") is None
 
-        updated = update_job(job["id"], {"script": "/new/script.py"})
-        assert updated["script"] == "/new/script.py"
+        script = cron_env / "scripts" / "new_script.py"
+        script.write_text('print("ok")\n')
+        updated = update_job(job["id"], {"script": "new_script.py"})
+        assert updated["script"] == "new_script.py"
 
     def test_update_job_clear_script(self, cron_env):
         from cron.jobs import create_job, update_job
 
-        job = create_job(prompt="Hello", schedule="every 1h", script="/some/script.py")
-        assert job["script"] == "/some/script.py"
+        script = cron_env / "scripts" / "some_script.py"
+        script.write_text('print("ok")\n')
+        job = create_job(prompt="Hello", schedule="every 1h", script="some_script.py")
+        assert job["script"] == "some_script.py"
 
         updated = update_job(job["id"], {"script": None})
         assert updated.get("script") is None
+
+    def test_create_job_missing_script_rejected(self, cron_env):
+        from cron.jobs import create_job
+
+        with pytest.raises(ValueError, match="not found"):
+            create_job(prompt="Hello", schedule="every 1h", script="missing.py")
 
 
 class TestRunJobScript:
@@ -222,6 +234,8 @@ class TestCronjobToolScript:
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         from tools.cronjob_tools import cronjob
 
+        script = cron_env / "scripts" / "monitor.py"
+        script.write_text('print("ok")\n')
         result = json.loads(cronjob(
             action="create",
             schedule="every 1h",
@@ -242,6 +256,8 @@ class TestCronjobToolScript:
         ))
         job_id = create_result["job_id"]
 
+        script = cron_env / "scripts" / "new_script.py"
+        script.write_text('print("ok")\n')
         update_result = json.loads(cronjob(
             action="update",
             job_id=job_id,
@@ -254,6 +270,8 @@ class TestCronjobToolScript:
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         from tools.cronjob_tools import cronjob
 
+        script = cron_env / "scripts" / "some_script.py"
+        script.write_text('print("ok")\n')
         create_result = json.loads(cronjob(
             action="create",
             schedule="every 1h",
@@ -274,6 +292,8 @@ class TestCronjobToolScript:
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         from tools.cronjob_tools import cronjob
 
+        script = cron_env / "scripts" / "data_collector.py"
+        script.write_text('print("ok")\n')
         cronjob(
             action="create",
             schedule="every 1h",
@@ -441,6 +461,8 @@ class TestCronjobToolScriptValidation:
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         from tools.cronjob_tools import cronjob
 
+        script = cron_env / "scripts" / "monitor.py"
+        script.write_text('print("ok")\n')
         result = json.loads(cronjob(
             action="create",
             schedule="every 1h",
@@ -474,6 +496,8 @@ class TestCronjobToolScriptValidation:
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         from tools.cronjob_tools import cronjob
 
+        script = cron_env / "scripts" / "monitor.py"
+        script.write_text('print("ok")\n')
         create_result = json.loads(cronjob(
             action="create",
             schedule="every 1h",

@@ -506,6 +506,65 @@ def _normalize_profile(profile: Optional[str]) -> Optional[str]:
     return normalized
 
 
+def _validate_job_script(
+    script: Optional[str],
+    *,
+    profile: Optional[str] = None,
+) -> Optional[str]:
+    """Validate a cron job's script path against the effective profile home.
+
+    Cron scripts must be relative paths that stay within
+    ``<HERMES_HOME>/scripts`` for the target profile, and the file must exist
+    at create/update time so the scheduler does not accept a doomed job that
+    can only fail later on schedule.
+
+    Returns ``None`` when the script field is empty/cleared. Raises
+    ``ValueError`` on invalid or missing scripts.
+    """
+    raw = str(script or "").strip()
+    if not raw:
+        return None
+
+    if raw.startswith(("/", "~")) or (len(raw) >= 2 and raw[1] == ":"):
+        raise ValueError(
+            "Cron script paths must be relative to the profile scripts "
+            f"directory. Got absolute or home-relative path: {raw!r}"
+        )
+
+    if profile:
+        from hermes_cli.profiles import resolve_profile_env
+
+        profile_home = Path(resolve_profile_env(profile)).resolve()
+    else:
+        profile_home = get_hermes_home().resolve()
+
+    scripts_dir = profile_home / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+
+    from tools.path_security import validate_within_dir
+
+    candidate = scripts_dir / raw
+    containment_error = validate_within_dir(candidate, scripts_dir)
+    if containment_error:
+        raise ValueError(
+            f"Cron script path escapes the profile scripts directory: {raw!r}"
+        )
+
+    resolved = candidate.resolve()
+    if not resolved.exists():
+        raise ValueError(
+            f"Cron script not found for profile "
+            f"{profile or 'default'}: {resolved}"
+        )
+    if not resolved.is_file():
+        raise ValueError(
+            f"Cron script path is not a file for profile "
+            f"{profile or 'default'}: {resolved}"
+        )
+
+    return raw
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -608,6 +667,10 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_profile = _normalize_profile(profile)
     normalized_no_agent = bool(no_agent)
+    normalized_script = _validate_job_script(
+        normalized_script,
+        profile=normalized_profile,
+    )
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -750,6 +813,17 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["profile"] = None
             else:
                 updates["profile"] = _normalize_profile(_profile)
+
+        effective_script = (
+            updates["script"] if "script" in updates else job.get("script")
+        )
+        effective_profile = (
+            updates["profile"] if "profile" in updates else job.get("profile")
+        )
+        updates["script"] = _validate_job_script(
+            effective_script,
+            profile=effective_profile,
+        )
 
         updated = _apply_skill_fields({**job, **updates})
         schedule_changed = "schedule" in updates

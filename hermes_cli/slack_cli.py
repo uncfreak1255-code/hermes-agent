@@ -23,6 +23,42 @@ import sys
 from pathlib import Path
 
 
+def _slack_shortcuts_manifest() -> list[dict[str, str]]:
+    """Return the Slack shortcut manifest entries Hermes expects."""
+    return [
+        {
+            "name": "Send to Hermes Brain",
+            "callback_id": "hermes_send_to_brain",
+            "description": "Send the selected message to Hermes Brain in DM.",
+            "type": "message",
+        },
+        {
+            "name": "Route this to Codex",
+            "callback_id": "hermes_route_to_codex",
+            "description": "Route the selected message to the right Codex lane.",
+            "type": "message",
+        },
+        {
+            "name": "Summarize this thread",
+            "callback_id": "hermes_summarize_thread",
+            "description": "Summarize the selected Slack thread in Hermes DM.",
+            "type": "message",
+        },
+        {
+            "name": "Create review item",
+            "callback_id": "hermes_create_review_item",
+            "description": "Turn the selected message into a review item.",
+            "type": "message",
+        },
+        {
+            "name": "Turn this into a brief",
+            "callback_id": "hermes_turn_into_brief",
+            "description": "Open a brief composer that sends the result to Hermes DM.",
+            "type": "global",
+        },
+    ]
+
+
 def _build_full_manifest(bot_name: str, bot_description: str) -> dict:
     """Build a full Slack manifest merging display info + our slash list.
 
@@ -58,6 +94,7 @@ def _build_full_manifest(bot_name: str, bot_description: str) -> dict:
                 "always_online": True,
             },
             "slash_commands": slashes,
+            "shortcuts": _slack_shortcuts_manifest(),
             "assistant_view": {
                 "assistant_description": "Chat with Hermes in threads and DMs.",
             },

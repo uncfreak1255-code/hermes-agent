@@ -928,6 +928,23 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         return False, f"Script execution failed: {exc}"
 
 
+def _is_invalid_script_config_error(script_output: str) -> bool:
+    """Return True when a script failure reflects a broken job config.
+
+    These are durable misconfigurations, not transient script runtime failures:
+    missing files, non-files, or paths that escape the profile scripts dir.
+    Jobs hitting these states should fail loudly and be paused until repaired.
+    """
+    text = str(script_output or "")
+    return text.startswith(
+        (
+            "Script not found:",
+            "Script path is not a file:",
+            "Blocked: script path resolves outside the scripts directory",
+        )
+    )
+
+
 def _parse_wake_gate(script_output: str) -> bool:
     """Parse the last non-empty stdout line of a cron job's pre-check script
     as a wake gate.
@@ -1280,6 +1297,15 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     if script_path:
         prerun_script = _run_job_script(script_path)
         _ran_ok, _script_output = prerun_script
+        if not _ran_ok and _is_invalid_script_config_error(_script_output):
+            broken_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                "Configured script is invalid or missing, so the agent was not run.\n\n"
+                f"{_script_output}\n"
+            )
+            return False, broken_doc, "", _script_output
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
@@ -1865,6 +1891,31 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             """Run one due job end-to-end: execute, save, deliver, mark."""
             try:
                 success, output, final_response, error = run_job(job)
+
+                auto_pause_reason = None
+                if (
+                    not success
+                    and job.get("script")
+                    and _is_invalid_script_config_error(error or "")
+                ):
+                    auto_pause_reason = (
+                        "Auto-paused after configured script became missing or invalid. "
+                        "Repair the script under this profile's scripts directory, then resume the job."
+                    )
+                    error = (
+                        f"{error}\n\n"
+                        f"{auto_pause_reason}"
+                    ).strip()
+                    try:
+                        from cron.jobs import pause_job
+
+                        pause_job(job["id"], reason=auto_pause_reason)
+                    except Exception as pause_exc:
+                        logger.warning(
+                            "Failed to auto-pause broken cron job %s: %s",
+                            job["id"],
+                            pause_exc,
+                        )
 
                 output_file = save_job_output(job["id"], output)
                 if verbose:

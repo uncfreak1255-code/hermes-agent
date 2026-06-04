@@ -594,7 +594,11 @@ class SlackAdapter(BasePlatformAdapter):
             # Register message event handler
             @self._app.event("message")
             async def handle_message_event(event, say):
-                await self._handle_slack_message(event)
+                await self._handle_slack_event_callback(
+                    event,
+                    handler=self._handle_slack_message,
+                    failure_label="message",
+                )
 
             # Handle app_mention explicitly. In some Slack app configurations,
             # channel mentions arrive only as app_mention events rather than the
@@ -605,7 +609,11 @@ class SlackAdapter(BasePlatformAdapter):
             # _handle_slack_message (MessageDeduplicator) suppresses the second.
             @self._app.event("app_mention")
             async def handle_app_mention(event, say):
-                await self._handle_slack_message(event)
+                await self._handle_slack_event_callback(
+                    event,
+                    handler=self._handle_slack_message,
+                    failure_label="mention",
+                )
 
             # File lifecycle events can arrive around snippet uploads even when
             # the actual user message is what we care about. Ack them so Slack
@@ -661,7 +669,23 @@ class SlackAdapter(BasePlatformAdapter):
                     response_type="ephemeral",
                     text=f"Running `/{slash}`…",
                 )
-                await self._handle_slash_command(command)
+                try:
+                    await self._handle_slash_command(command)
+                except Exception as exc:
+                    logger.exception(
+                        "[Slack] Slash command %r failed: %s",
+                        command.get("command"),
+                        exc,
+                    )
+                    response_url = command.get("response_url", "")
+                    if response_url:
+                        await self._send_slash_ephemeral(
+                            {"response_url": response_url},
+                            (
+                                "Something went wrong while handling that command. "
+                                "Check Hermes logs, fix the error, then try again."
+                            ),
+                        )
 
             # Register Block Kit action handlers for approval buttons
             for _action_id in (
@@ -1763,6 +1787,38 @@ class SlackAdapter(BasePlatformAdapter):
         metadata = self._extract_assistant_thread_metadata(event)
         self._cache_assistant_thread_metadata(metadata)
         self._seed_assistant_thread_session(metadata)
+
+    async def _handle_slack_event_callback(
+        self,
+        event: dict,
+        *,
+        handler,
+        failure_label: str,
+    ) -> None:
+        """Run a Slack event callback without letting exceptions escape to Bolt."""
+        try:
+            await handler(event)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.exception(
+                "[Slack] %s callback failed for channel=%r user=%r ts=%r: %s",
+                failure_label,
+                event.get("channel"),
+                event.get("user"),
+                event.get("ts"),
+                exc,
+            )
+            channel_id = event.get("channel", "")
+            user_id = event.get("user", "")
+            if channel_id and user_id:
+                await self.send_private_notice(
+                    chat_id=channel_id,
+                    user_id=user_id,
+                    content=(
+                        "Something went wrong while handling that message. "
+                        "Check Hermes logs, fix the error, then try again."
+                    ),
+                    metadata={"thread_id": event.get("thread_ts")},
+                )
 
     async def _handle_slack_message(self, event: dict) -> None:
         """Handle an incoming Slack message event."""

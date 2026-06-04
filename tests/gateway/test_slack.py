@@ -206,6 +206,131 @@ class TestAppMentionHandler:
                 f"Slack slash regex does not match {expected}"
             )
 
+    def test_slash_callback_converts_handler_exception_to_ephemeral_error(self):
+        """A slash-command handler crash should not bubble up to Slack's generic error UI."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        registered_callbacks = {}
+        mock_app = MagicMock()
+
+        def mock_event(_event_type):
+            def decorator(fn):
+                return fn
+            return decorator
+
+        def mock_command(cmd):
+            def decorator(fn):
+                registered_callbacks["slash"] = fn
+                return fn
+            return decorator
+
+        mock_app.event = mock_event
+        mock_app.command = mock_command
+        mock_app.action = MagicMock(side_effect=lambda *_args, **_kwargs: (lambda fn: fn))
+        mock_app.client = AsyncMock()
+        mock_app.client.auth_test = AsyncMock(return_value={
+            "user_id": "U_BOT",
+            "user": "testbot",
+        })
+
+        mock_web_client = AsyncMock()
+        mock_web_client.auth_test = AsyncMock(return_value={
+            "user_id": "U_BOT",
+            "user": "testbot",
+            "team_id": "T_FAKE",
+            "team": "FakeTeam",
+        })
+
+        with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
+             patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
+             patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=MagicMock()), \
+             patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
+             patch("asyncio.create_task"), \
+             patch.object(adapter, "_handle_slash_command", AsyncMock(side_effect=RuntimeError("boom"))), \
+             patch.object(adapter, "_send_slash_ephemeral", AsyncMock()) as mock_ephemeral:
+            asyncio.run(adapter.connect())
+            callback = registered_callbacks["slash"]
+            ack = AsyncMock()
+            asyncio.run(
+                callback(
+                    ack,
+                    {
+                        "command": "/hermes",
+                        "text": "status",
+                        "response_url": "https://hooks.slack.com/commands/T1/2/boom",
+                    },
+                )
+            )
+
+        ack.assert_awaited_once()
+        mock_ephemeral.assert_awaited_once()
+        assert "Something went wrong while handling that command." in mock_ephemeral.await_args.args[1]
+
+    def test_message_callback_converts_handler_exception_to_private_notice(self):
+        """A message handler crash should not bubble up to Slack's generic error UI."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        registered_callbacks = {}
+        mock_app = MagicMock()
+
+        def mock_event(event_type):
+            def decorator(fn):
+                registered_callbacks[event_type] = fn
+                return fn
+            return decorator
+
+        def mock_command(_cmd):
+            def decorator(fn):
+                return fn
+            return decorator
+
+        mock_app.event = mock_event
+        mock_app.command = mock_command
+        mock_app.action = MagicMock(side_effect=lambda *_args, **_kwargs: (lambda fn: fn))
+        mock_app.client = AsyncMock()
+        mock_app.client.auth_test = AsyncMock(return_value={
+            "user_id": "U_BOT",
+            "user": "testbot",
+        })
+
+        mock_web_client = AsyncMock()
+        mock_web_client.auth_test = AsyncMock(return_value={
+            "user_id": "U_BOT",
+            "user": "testbot",
+            "team_id": "T_FAKE",
+            "team": "FakeTeam",
+        })
+
+        with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
+             patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
+             patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=MagicMock()), \
+             patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
+             patch("asyncio.create_task"), \
+             patch.object(adapter, "_handle_slack_message", AsyncMock(side_effect=RuntimeError("boom"))), \
+             patch.object(adapter, "send_private_notice", AsyncMock()) as mock_notice:
+            asyncio.run(adapter.connect())
+            callback = registered_callbacks["message"]
+            asyncio.run(
+                callback(
+                    {
+                        "channel": "C123",
+                        "user": "U123",
+                        "text": "hello",
+                        "ts": "1234.5678",
+                    },
+                    AsyncMock(),
+                )
+            )
+
+        mock_notice.assert_awaited_once()
+        assert mock_notice.await_args.kwargs["chat_id"] == "C123"
+        assert mock_notice.await_args.kwargs["user_id"] == "U123"
+        assert "Something went wrong while handling that message." in mock_notice.await_args.kwargs["content"]
+
 
 class TestSlackConnectCleanup:
     """Regression coverage for failed connect() cleanup."""
