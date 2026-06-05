@@ -390,6 +390,31 @@ def test_custom_endpoint_uses_saved_config_base_url_when_env_missing(monkeypatch
     assert resolved["api_key"] == "local-key"
 
 
+def test_string_model_config_preserves_top_level_custom_runtime_fields(monkeypatch):
+    """Legacy string model config should still carry endpoint metadata."""
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "model": "local/model",
+            "provider": "custom",
+            "base_url": "http://127.0.0.1:8080/v1",
+            "api_mode": "chat_completions",
+            "api_key": "local-key",
+        },
+    )
+
+    model_config = rp._get_model_config()
+
+    assert model_config == {
+        "default": "local/model",
+        "provider": "custom",
+        "base_url": "http://127.0.0.1:8080/v1",
+        "api_mode": "chat_completions",
+        "api_key": "local-key",
+    }
+
+
 def test_custom_endpoint_uses_config_api_key_over_env(monkeypatch):
     """provider: custom with base_url and api_key in config uses them (#1760)."""
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")

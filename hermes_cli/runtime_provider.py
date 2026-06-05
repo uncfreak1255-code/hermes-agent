@@ -78,7 +78,11 @@ def _get_model_config() -> Dict[str, Any]:
                 cfg["default"] = detected
         return cfg
     if isinstance(model_cfg, str) and model_cfg.strip():
-        return {"default": model_cfg.strip()}
+        cfg = {"default": model_cfg.strip()}
+        for k in ("provider", "base_url", "api_mode", "api", "api_key"):
+            if k in config:
+                cfg[k] = config[k]
+        return cfg
     return {}
 
 
