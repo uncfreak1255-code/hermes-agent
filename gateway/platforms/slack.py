@@ -503,6 +503,47 @@ class SlackAdapter(BasePlatformAdapter):
         # Non-fatal — the user saw the initial ack already.
         return SendResult(success=True, message_id=None)
 
+    async def _send_slash_context_reply(
+        self,
+        ctx: Dict[str, Any],
+        content: str,
+        *,
+        chat_id: Optional[str] = None,
+    ) -> "SendResult":
+        """Deliver a slash-command reply using the best available Slack surface."""
+        if ctx.get("response_url"):
+            return await self._send_slash_ephemeral(ctx, content)
+
+        target_chat_id = chat_id or ctx.get("channel_id", "")
+        user_id = ctx.get("user_id", "")
+        if target_chat_id and user_id and not str(target_chat_id).startswith("D"):
+            result = await self.send_private_notice(
+                chat_id=target_chat_id,
+                user_id=user_id,
+                content=content,
+            )
+            if result.success:
+                return result
+
+        if target_chat_id:
+            try:
+                formatted = self.format_message(content)
+                chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+                last_result = None
+                for chunk in chunks:
+                    last_result = await self._get_client(target_chat_id).chat_postMessage(
+                        channel=target_chat_id,
+                        text=chunk,
+                        mrkdwn=True,
+                    )
+                sent_ts = last_result.get("ts") if last_result else None
+                return SendResult(success=True, message_id=sent_ts, raw_response=last_result)
+            except Exception as exc:
+                logger.warning("[Slack] slash reply fallback post failed: %s", exc)
+                return SendResult(success=False, error=str(exc))
+
+        return SendResult(success=False, error="No Slack reply target available")
+
     async def connect(self) -> bool:
         """Connect to Slack via Socket Mode."""
         if not SLACK_AVAILABLE:
@@ -678,14 +719,46 @@ class SlackAdapter(BasePlatformAdapter):
                         exc,
                     )
                     response_url = command.get("response_url", "")
-                    if response_url:
-                        await self._send_slash_ephemeral(
-                            {"response_url": response_url},
-                            (
-                                "Something went wrong while handling that command. "
-                                "Check Hermes logs, fix the error, then try again."
-                            ),
-                        )
+                    await self._send_slash_context_reply(
+                        {
+                            "response_url": response_url,
+                            "channel_id": command.get("channel_id", ""),
+                            "user_id": command.get("user_id", ""),
+                        },
+                        (
+                            "Something went wrong while handling that command. "
+                            "Check Hermes logs, fix the error, then try again."
+                        ),
+                    )
+
+            async def handle_hermes_shortcut(ack, body):
+                await ack()
+                try:
+                    await self._handle_slack_shortcut(body)
+                except Exception as exc:
+                    logger.exception(
+                        "[Slack] Shortcut %r failed: %s",
+                        body.get("callback_id"),
+                        exc,
+                    )
+                    await self._send_slack_shortcut_fallback(
+                        body,
+                        (
+                            "Something went wrong while handling that Slack shortcut. "
+                            "Check Hermes logs, fix the error, then try again."
+                        ),
+                    )
+
+            shortcut = getattr(self._app, "shortcut", None)
+            if callable(shortcut):
+                for _callback_id in (
+                    "hermes_send_to_brain",
+                    "hermes_route_to_codex",
+                    "hermes_summarize_thread",
+                    "hermes_create_review_item",
+                    "hermes_turn_into_brief",
+                ):
+                    shortcut(_callback_id)(handle_hermes_shortcut)
 
             # Register Block Kit action handlers for approval buttons
             for _action_id in (
@@ -798,8 +871,8 @@ class SlackAdapter(BasePlatformAdapter):
             # the actual command reply ephemerally instead of posting publicly.
             slash_ctx = self._pop_slash_context(chat_id)
             if slash_ctx:
-                return await self._send_slash_ephemeral(
-                    slash_ctx, content,
+                return await self._send_slash_context_reply(
+                    slash_ctx, content, chat_id=chat_id,
                 )
 
             # Convert standard markdown → Slack mrkdwn
@@ -1819,6 +1892,103 @@ class SlackAdapter(BasePlatformAdapter):
                     ),
                     metadata={"thread_id": event.get("thread_ts")},
                 )
+
+    async def _open_user_dm(self, user_id: str) -> Optional[str]:
+        """Open a DM with a Slack user and return its channel ID."""
+        if not self._app or not user_id:
+            return None
+        result = await self._app.client.conversations_open(users=user_id)
+        channel = result.get("channel", {}) if isinstance(result, dict) else {}
+        channel_id = channel.get("id") or result.get("id") if isinstance(result, dict) else None
+        return str(channel_id) if channel_id else None
+
+    def _shortcut_prompt_text(self, body: dict) -> str:
+        """Translate an advertised Slack shortcut into a Hermes DM prompt."""
+        callback_id = body.get("callback_id", "")
+        message = body.get("message", {}) if isinstance(body.get("message"), dict) else {}
+        selected_text = (message.get("text") or "").strip()
+        channel_id = body.get("channel", {}).get("id", "") if isinstance(body.get("channel"), dict) else ""
+        message_ts = message.get("thread_ts") or message.get("ts") or ""
+
+        labels = {
+            "hermes_send_to_brain": "Save this Slack message to Hermes Brain.",
+            "hermes_route_to_codex": "Route this Slack message to the right Codex lane.",
+            "hermes_summarize_thread": "Summarize this Slack thread.",
+            "hermes_create_review_item": "Turn this Slack message into a review item.",
+            "hermes_turn_into_brief": "Turn this into a brief. Ask me for missing details if needed.",
+        }
+        prompt = labels.get(callback_id, "Handle this Slack shortcut.")
+        context_parts = []
+        if channel_id:
+            context_parts.append(f"Channel: {channel_id}")
+        if message_ts:
+            context_parts.append(f"Message/thread ts: {message_ts}")
+        if selected_text:
+            context_parts.append(f"Selected message:\n{selected_text}")
+        if context_parts:
+            return f"{prompt}\n\n" + "\n\n".join(context_parts)
+        return prompt
+
+    async def _send_slack_shortcut_fallback(self, body: dict, content: str) -> SendResult:
+        """Send a useful shortcut reply even when Slack omits response_url."""
+        user_id = body.get("user", {}).get("id", "") if isinstance(body.get("user"), dict) else ""
+        response_url = body.get("response_url", "")
+        channel_id = body.get("channel", {}).get("id", "") if isinstance(body.get("channel"), dict) else ""
+        dm_channel_id = None
+        if user_id:
+            try:
+                dm_channel_id = await self._open_user_dm(user_id)
+            except Exception as exc:
+                logger.warning("[Slack] shortcut fallback DM open failed: %s", exc)
+
+        if dm_channel_id:
+            return await self._send_slash_context_reply(
+                {"channel_id": dm_channel_id, "user_id": user_id},
+                content,
+                chat_id=dm_channel_id,
+            )
+
+        return await self._send_slash_context_reply(
+            {
+                "response_url": response_url,
+                "channel_id": channel_id,
+                "user_id": user_id,
+            },
+            content,
+            chat_id=channel_id or None,
+        )
+
+    async def _handle_slack_shortcut(self, body: dict) -> None:
+        """Route advertised Slack shortcuts into the invoking user's Hermes DM."""
+        user_id = body.get("user", {}).get("id", "") if isinstance(body.get("user"), dict) else ""
+        if not user_id:
+            await self._send_slack_shortcut_fallback(
+                body,
+                "Hermes received that Slack shortcut, but Slack did not include a user ID.",
+            )
+            return
+
+        dm_channel_id = await self._open_user_dm(user_id)
+        if not dm_channel_id:
+            await self._send_slack_shortcut_fallback(
+                body,
+                "Hermes received that Slack shortcut, but could not open your Slack DM.",
+            )
+            return
+
+        source = self.build_source(
+            chat_id=dm_channel_id,
+            chat_name=dm_channel_id,
+            chat_type="dm",
+            user_id=user_id,
+        )
+        event = MessageEvent(
+            text=self._shortcut_prompt_text(body),
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=body,
+        )
+        await self.handle_message(event)
 
     async def _handle_slack_message(self, event: dict) -> None:
         """Handle an incoming Slack message event."""
@@ -2882,9 +3052,11 @@ class SlackAdapter(BasePlatformAdapter):
         # questions via "/hermes <question>" must produce public replies so
         # the whole channel can see the agent's answer.
         response_url = command.get("response_url", "")
-        if response_url and user_id and channel_id and text.startswith("/"):
+        if user_id and channel_id and text.startswith("/"):
             self._slash_command_contexts[(channel_id, user_id)] = {
                 "response_url": response_url,
+                "channel_id": channel_id,
+                "user_id": user_id,
                 "ts": time.monotonic(),
             }
 

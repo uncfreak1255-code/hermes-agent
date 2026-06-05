@@ -19,14 +19,18 @@ logger = logging.getLogger(__name__)
 DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
 
 
-def _default_visible_platforms() -> Optional[set[str]]:
-    """Return the platforms that should be shown by default to operators.
+def _front_door_platform_filter(platforms: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Return the operator-facing platform filter and hidden-platform audit trail.
 
     Preference order:
     1. Live runtime state (`gateway_state.json`) — only show connected platforms.
     2. Configured/connected platforms from `config.yaml`.
     3. Fall back to showing everything in the cached directory.
     """
+    visible: Optional[set[str]] = None
+    source = "all"
+    runtime_platforms: Dict[str, Any] = {}
+
     try:
         from gateway.status import read_runtime_status
 
@@ -38,21 +42,58 @@ def _default_visible_platforms() -> Optional[set[str]]:
             if isinstance(details, dict) and details.get("state") == "connected"
         }
         if connected:
-            return connected
+            visible = connected
+            source = "runtime_status"
     except Exception:
         logger.debug("Channel directory: failed to read runtime status", exc_info=True)
 
-    try:
-        from gateway.config import load_gateway_config
+    if visible is None:
+        try:
+            from gateway.config import load_gateway_config
 
-        config = load_gateway_config()
-        configured = {platform.value for platform in config.get_connected_platforms()}
-        if configured:
-            return configured
-    except Exception:
-        logger.debug("Channel directory: failed to infer configured platforms", exc_info=True)
+            config = load_gateway_config()
+            configured = {platform.value for platform in config.get_connected_platforms()}
+            if configured:
+                visible = configured
+                source = "config"
+        except Exception:
+            logger.debug("Channel directory: failed to infer configured platforms", exc_info=True)
 
-    return None
+    hidden_platforms: List[Dict[str, Any]] = []
+    if visible:
+        for name, channels in sorted(platforms.items()):
+            if name in visible or not channels:
+                continue
+            state = None
+            if isinstance(runtime_platforms.get(name), dict):
+                state = runtime_platforms[name].get("state")
+            if source == "runtime_status":
+                reason = f"runtime_state_{state or 'missing'}"
+            else:
+                reason = "not_enabled_in_config"
+            hidden_platforms.append({
+                "platform": name,
+                "reason": reason,
+                "state": state,
+                "channel_count": len(channels),
+            })
+
+    return {
+        "mode": "active_platforms_only" if visible else "all_platforms",
+        "source": source,
+        "visible_platforms": sorted(visible) if visible else sorted(
+            name for name, channels in platforms.items() if channels
+        ),
+        "hidden_platforms": hidden_platforms,
+    }
+
+
+def _default_visible_platforms() -> Optional[set[str]]:
+    """Return the platforms that should be shown by default to operators."""
+    filter_info = _front_door_platform_filter({})
+    if filter_info["mode"] != "active_platforms_only":
+        return None
+    return set(filter_info["visible_platforms"])
 
 
 def _normalize_channel_query(value: str) -> str:
@@ -135,6 +176,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     directory = {
         "updated_at": datetime.now().isoformat(),
         "platforms": platforms,
+        "front_door_filter": _front_door_platform_filter(platforms),
     }
 
     try:

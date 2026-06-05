@@ -147,6 +147,7 @@ class TestAppMentionHandler:
         # Track which events get registered
         registered_events = []
         registered_commands = []
+        registered_shortcuts = []
 
         mock_app = MagicMock()
 
@@ -162,8 +163,15 @@ class TestAppMentionHandler:
                 return fn
             return decorator
 
+        def mock_shortcut(callback_id):
+            def decorator(fn):
+                registered_shortcuts.append(callback_id)
+                return fn
+            return decorator
+
         mock_app.event = mock_event
         mock_app.command = mock_command
+        mock_app.shortcut = mock_shortcut
         mock_app.client = AsyncMock()
         mock_app.client.auth_test = AsyncMock(return_value={
             "user_id": "U_BOT",
@@ -205,6 +213,13 @@ class TestAppMentionHandler:
             assert slash_matcher.match(expected), (
                 f"Slack slash regex does not match {expected}"
             )
+        assert set(registered_shortcuts) == {
+            "hermes_send_to_brain",
+            "hermes_route_to_codex",
+            "hermes_summarize_thread",
+            "hermes_create_review_item",
+            "hermes_turn_into_brief",
+        }
 
     def test_slash_callback_converts_handler_exception_to_ephemeral_error(self):
         """A slash-command handler crash should not bubble up to Slack's generic error UI."""
@@ -249,7 +264,7 @@ class TestAppMentionHandler:
              patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
              patch("asyncio.create_task"), \
              patch.object(adapter, "_handle_slash_command", AsyncMock(side_effect=RuntimeError("boom"))), \
-             patch.object(adapter, "_send_slash_ephemeral", AsyncMock()) as mock_ephemeral:
+             patch.object(adapter, "_send_slash_context_reply", AsyncMock()) as mock_reply:
             asyncio.run(adapter.connect())
             callback = registered_callbacks["slash"]
             ack = AsyncMock()
@@ -265,8 +280,74 @@ class TestAppMentionHandler:
             )
 
         ack.assert_awaited_once()
-        mock_ephemeral.assert_awaited_once()
-        assert "Something went wrong while handling that command." in mock_ephemeral.await_args.args[1]
+        mock_reply.assert_awaited_once()
+        assert mock_reply.await_args.args[0]["response_url"] == "https://hooks.slack.com/commands/T1/2/boom"
+        assert "Something went wrong while handling that command." in mock_reply.await_args.args[1]
+
+    def test_slash_callback_without_response_url_sends_private_error(self):
+        """A slash-command crash without response_url should still reach the user."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        registered_callbacks = {}
+        mock_app = MagicMock()
+
+        def mock_event(_event_type):
+            def decorator(fn):
+                return fn
+            return decorator
+
+        def mock_command(cmd):
+            def decorator(fn):
+                registered_callbacks["slash"] = fn
+                return fn
+            return decorator
+
+        mock_app.event = mock_event
+        mock_app.command = mock_command
+        mock_app.action = MagicMock(side_effect=lambda *_args, **_kwargs: (lambda fn: fn))
+        mock_app.client = AsyncMock()
+        mock_app.client.auth_test = AsyncMock(return_value={
+            "user_id": "U_BOT",
+            "user": "testbot",
+        })
+
+        mock_web_client = AsyncMock()
+        mock_web_client.auth_test = AsyncMock(return_value={
+            "user_id": "U_BOT",
+            "user": "testbot",
+            "team_id": "T_FAKE",
+            "team": "FakeTeam",
+        })
+
+        with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
+             patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
+             patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=MagicMock()), \
+             patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
+             patch("asyncio.create_task"), \
+             patch.object(adapter, "_handle_slash_command", AsyncMock(side_effect=RuntimeError("boom"))), \
+             patch.object(adapter, "send_private_notice", AsyncMock(return_value=SendResult(success=True))) as mock_notice:
+            asyncio.run(adapter.connect())
+            callback = registered_callbacks["slash"]
+            ack = AsyncMock()
+            asyncio.run(
+                callback(
+                    ack,
+                    {
+                        "command": "/hermes",
+                        "text": "status",
+                        "channel_id": "C123",
+                        "user_id": "U123",
+                    },
+                )
+            )
+
+        ack.assert_awaited_once()
+        mock_notice.assert_awaited_once()
+        assert mock_notice.await_args.kwargs["chat_id"] == "C123"
+        assert mock_notice.await_args.kwargs["user_id"] == "U123"
+        assert "Something went wrong while handling that command." in mock_notice.await_args.kwargs["content"]
 
     def test_message_callback_converts_handler_exception_to_private_notice(self):
         """A message handler crash should not bubble up to Slack's generic error UI."""
@@ -330,6 +411,55 @@ class TestAppMentionHandler:
         assert mock_notice.await_args.kwargs["chat_id"] == "C123"
         assert mock_notice.await_args.kwargs["user_id"] == "U123"
         assert "Something went wrong while handling that message." in mock_notice.await_args.kwargs["content"]
+
+
+class TestSlackShortcuts:
+    @pytest.mark.asyncio
+    async def test_shortcut_routes_selected_message_into_user_dm(self, adapter):
+        adapter._app.client.conversations_open = AsyncMock(return_value={"channel": {"id": "D_USER"}})
+
+        body = {
+            "callback_id": "hermes_summarize_thread",
+            "user": {"id": "U123"},
+            "channel": {"id": "C123"},
+            "message": {
+                "ts": "1710000000.000100",
+                "thread_ts": "1710000000.000100",
+                "text": "Owner asked for a short status update.",
+            },
+        }
+
+        await adapter._handle_slack_shortcut(body)
+
+        adapter._app.client.conversations_open.assert_awaited_once_with(users="U123")
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.chat_id == "D_USER"
+        assert event.source.chat_type == "dm"
+        assert event.source.user_id == "U123"
+        assert "Summarize this Slack thread." in event.text
+        assert "Owner asked for a short status update." in event.text
+
+    @pytest.mark.asyncio
+    async def test_shortcut_without_response_url_fallback_posts_to_dm(self, adapter):
+        adapter._app.client.conversations_open = AsyncMock(return_value={"channel": {"id": "D_USER"}})
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "123.456"})
+
+        result = await adapter._send_slack_shortcut_fallback(
+            {
+                "callback_id": "hermes_route_to_codex",
+                "user": {"id": "U123"},
+                "channel": {"id": "C123"},
+                # Slack may omit response_url for shortcuts.
+            },
+            "Queued that Slack shortcut in Hermes DM.",
+        )
+
+        assert result.success is True
+        adapter._app.client.conversations_open.assert_awaited_once_with(users="U123")
+        adapter._app.client.chat_postMessage.assert_awaited_once()
+        assert adapter._app.client.chat_postMessage.await_args.kwargs["channel"] == "D_USER"
+        assert "Queued that Slack shortcut" in adapter._app.client.chat_postMessage.await_args.kwargs["text"]
 
 
 class TestSlackConnectCleanup:
@@ -3051,8 +3181,8 @@ class TestSlashEphemeralAck:
         assert "ts" in ctx
 
     @pytest.mark.asyncio
-    async def test_slash_command_without_response_url_does_not_stash(self, adapter):
-        """Commands without a response_url should not create a context."""
+    async def test_slash_command_without_response_url_stashes_private_fallback(self, adapter):
+        """Commands without a response_url keep enough context for a private fallback."""
         command = {
             "command": "/stop",
             "text": "",
@@ -3061,7 +3191,8 @@ class TestSlashEphemeralAck:
             # no response_url
         }
         await adapter._handle_slash_command(command)
-        assert len(adapter._slash_command_contexts) == 0
+        assert adapter._slash_command_contexts[("C1", "U1")]["response_url"] == ""
+        assert adapter._slash_command_contexts[("C1", "U1")]["user_id"] == "U1"
 
     @pytest.mark.asyncio
     async def test_pop_slash_context_returns_and_removes(self, adapter):
@@ -3142,6 +3273,48 @@ class TestSlashEphemeralAck:
 
         assert result.success is True
         adapter._app.client.chat_postMessage.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_send_without_response_url_uses_private_notice(self, adapter):
+        """Missing response_url should still deliver command output privately."""
+        import time
+        adapter._slash_command_contexts[("C_SLASH", "U_SLASH")] = {
+            "response_url": "",
+            "channel_id": "C_SLASH",
+            "user_id": "U_SLASH",
+            "ts": time.monotonic(),
+        }
+        adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True, message_id="eph.1"))
+
+        result = await adapter.send("C_SLASH", "Stopped the current run.")
+
+        assert result.success is True
+        adapter.send_private_notice.assert_awaited_once_with(
+            chat_id="C_SLASH",
+            user_id="U_SLASH",
+            content="Stopped the current run.",
+        )
+        assert len(adapter._slash_command_contexts) == 0
+
+    @pytest.mark.asyncio
+    async def test_send_without_response_url_falls_back_to_channel_post(self, adapter):
+        """If private notice fails, post a visible useful reply instead of dropping it."""
+        import time
+        adapter._slash_command_contexts[("C_SLASH", "U_SLASH")] = {
+            "response_url": "",
+            "channel_id": "C_SLASH",
+            "user_id": "U_SLASH",
+            "ts": time.monotonic(),
+        }
+        adapter.send_private_notice = AsyncMock(return_value=SendResult(success=False, error="no_permission"))
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5"})
+
+        result = await adapter.send("C_SLASH", "Stopped the current run.")
+
+        assert result.success is True
+        adapter.send_private_notice.assert_awaited_once()
+        adapter._app.client.chat_postMessage.assert_awaited_once()
+        assert adapter._app.client.chat_postMessage.await_args.kwargs["channel"] == "C_SLASH"
 
     @pytest.mark.asyncio
     async def test_send_slash_ephemeral_fallback_on_post_failure(self, adapter):

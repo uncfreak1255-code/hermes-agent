@@ -27,6 +27,12 @@ def _write_directory(tmp_path, platforms):
     return cache_file
 
 
+def _write_sessions(hermes_home, sessions):
+    sessions_dir = hermes_home / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    (sessions_dir / "sessions.json").write_text(json.dumps(sessions), encoding="utf-8")
+
+
 class TestLoadDirectory:
     def test_missing_file(self, tmp_path):
         with patch("gateway.channel_directory.DIRECTORY_PATH", tmp_path / "nope.json"):
@@ -69,6 +75,43 @@ class TestBuildChannelDirectoryWrites:
             result = load_directory()
 
         assert result == previous
+
+    def test_writes_front_door_filter_audit_for_hidden_legacy_platforms(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _write_sessions(hermes_home, {
+            "slack-session": {
+                "chat_type": "channel",
+                "origin": {"platform": "slack", "chat_id": "C01", "chat_name": "agent-inbox"},
+            },
+            "telegram-legacy": {
+                "chat_type": "dm",
+                "origin": {"platform": "telegram", "chat_id": "123", "chat_name": "Alice"},
+            },
+        })
+        cache_file = tmp_path / "channel_directory.json"
+        runtime_status = {
+            "platforms": {
+                "slack": {"state": "connected"},
+                "telegram": {"state": "disconnected"},
+            }
+        }
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.status.read_runtime_status", return_value=runtime_status):
+            directory = asyncio.run(build_channel_directory({}))
+
+        written = json.loads(cache_file.read_text())
+        assert written["front_door_filter"] == directory["front_door_filter"]
+        assert directory["front_door_filter"]["source"] == "runtime_status"
+        assert directory["front_door_filter"]["visible_platforms"] == ["slack"]
+        assert directory["front_door_filter"]["hidden_platforms"] == [{
+            "platform": "telegram",
+            "reason": "runtime_state_disconnected",
+            "state": "disconnected",
+            "channel_count": 1,
+        }]
 
 
 class TestResolveChannelName:
@@ -343,6 +386,26 @@ class TestFormatDirectoryForDisplay:
 
         assert "Slack:" in result
         assert "Telegram:" in result
+
+    def test_filters_to_config_connected_platforms_when_runtime_state_absent(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "slack": [{"id": "C01", "name": "agent-inbox", "type": "channel"}],
+            "telegram": [{"id": "123", "name": "Alice", "type": "dm"}],
+        })
+        config = SimpleNamespace(
+            get_connected_platforms=lambda: [SimpleNamespace(value="slack")]
+        )
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.status.read_runtime_status", return_value={"platforms": {}}), \
+             patch("gateway.config.load_gateway_config", return_value=config):
+            result = format_directory_for_display()
+
+        assert "Slack:" in result
+        assert "slack:agent-inbox" in result
+        assert "Telegram:" not in result
+        assert 'e.g. "slack"' in result
+        assert 'e.g. "telegram"' not in result
 
 
 class TestLookupChannelType:
