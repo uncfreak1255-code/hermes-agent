@@ -305,6 +305,45 @@ class TestFormatDirectoryForDisplay:
         assert "Discord (Server2):" in result
         assert "discord:#general" in result
 
+    def test_filters_to_runtime_connected_platforms_by_default(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "slack": [{"id": "C01", "name": "agent-inbox", "type": "channel"}],
+            "telegram": [{"id": "123", "name": "Alice", "type": "dm"}],
+        })
+        runtime_status = {
+            "platforms": {
+                "slack": {"state": "connected"},
+                "telegram": {"state": "disconnected"},
+            }
+        }
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.status.read_runtime_status", return_value=runtime_status):
+            result = format_directory_for_display()
+
+        assert "Slack:" in result
+        assert "slack:agent-inbox" in result
+        assert "Telegram:" not in result
+        assert 'e.g. "slack"' in result
+        assert 'e.g. "telegram"' not in result
+
+    def test_include_inactive_shows_legacy_platforms_for_audit(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "slack": [{"id": "C01", "name": "agent-inbox", "type": "channel"}],
+            "telegram": [{"id": "123", "name": "Alice", "type": "dm"}],
+        })
+        runtime_status = {
+            "platforms": {
+                "slack": {"state": "connected"},
+                "telegram": {"state": "disconnected"},
+            }
+        }
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.status.read_runtime_status", return_value=runtime_status):
+            result = format_directory_for_display(include_inactive=True)
+
+        assert "Slack:" in result
+        assert "Telegram:" in result
+
 
 class TestLookupChannelType:
     def _setup(self, tmp_path, platforms):

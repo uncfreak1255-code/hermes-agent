@@ -19,6 +19,42 @@ logger = logging.getLogger(__name__)
 DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
 
 
+def _default_visible_platforms() -> Optional[set[str]]:
+    """Return the platforms that should be shown by default to operators.
+
+    Preference order:
+    1. Live runtime state (`gateway_state.json`) — only show connected platforms.
+    2. Configured/connected platforms from `config.yaml`.
+    3. Fall back to showing everything in the cached directory.
+    """
+    try:
+        from gateway.status import read_runtime_status
+
+        runtime = read_runtime_status() or {}
+        runtime_platforms = runtime.get("platforms") or {}
+        connected = {
+            str(name)
+            for name, details in runtime_platforms.items()
+            if isinstance(details, dict) and details.get("state") == "connected"
+        }
+        if connected:
+            return connected
+    except Exception:
+        logger.debug("Channel directory: failed to read runtime status", exc_info=True)
+
+    try:
+        from gateway.config import load_gateway_config
+
+        config = load_gateway_config()
+        configured = {platform.value for platform in config.get_connected_platforms()}
+        if configured:
+            return configured
+    except Exception:
+        logger.debug("Channel directory: failed to infer configured platforms", exc_info=True)
+
+    return None
+
+
 def _normalize_channel_query(value: str) -> str:
     return value.lstrip("#").strip().lower()
 
@@ -311,10 +347,18 @@ def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
     return None
 
 
-def format_directory_for_display() -> str:
+def format_directory_for_display(include_inactive: bool = False) -> str:
     """Format the channel directory as a human-readable list for the model."""
     directory = load_directory()
-    platforms = directory.get("platforms", {})
+    platforms = dict(directory.get("platforms", {}))
+    if not include_inactive:
+        visible = _default_visible_platforms()
+        if visible:
+            platforms = {
+                name: channels
+                for name, channels in platforms.items()
+                if name in visible
+            }
 
     if not any(platforms.values()):
         return "No messaging platforms connected or no channels discovered yet."
@@ -352,6 +396,10 @@ def format_directory_for_display() -> str:
             lines.append("")
 
     lines.append('Use these as the "target" parameter when sending.')
-    lines.append('Bare platform name (e.g. "telegram") sends to home channel.')
+    example_platform = next((name for name, channels in platforms.items() if channels), None)
+    if example_platform:
+        lines.append(f'Bare platform name (e.g. "{example_platform}") sends to home channel.')
+    else:
+        lines.append("Bare platform name sends to that platform's home channel.")
 
     return "\n".join(lines)
