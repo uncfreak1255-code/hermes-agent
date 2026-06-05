@@ -1298,6 +1298,10 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         prerun_script = _run_job_script(script_path)
         _ran_ok, _script_output = prerun_script
         if not _ran_ok and _is_invalid_script_config_error(_script_output):
+            visible_failure = (
+                f"⚠️ Cron job '{job_name}' failed:\n"
+                f"{_script_output}"
+            )
             broken_doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"
@@ -1305,7 +1309,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 "Configured script is invalid or missing, so the agent was not run.\n\n"
                 f"{_script_output}\n"
             )
-            return False, broken_doc, "", _script_output
+            return False, broken_doc, visible_failure, _script_output
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
@@ -1924,7 +1928,14 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but
                 # output is already saved above).  Failed jobs always deliver.
-                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+                if success:
+                    deliver_content = final_response
+                else:
+                    deliver_content = (
+                        final_response
+                        if final_response.strip()
+                        else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+                    )
                 # Treat whitespace-only final responses the same as empty
                 # responses: do not deliver a blank message, and let the
                 # empty-response guard below mark the run as a soft failure.

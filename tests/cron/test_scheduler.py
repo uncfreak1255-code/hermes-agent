@@ -2104,6 +2104,26 @@ class TestRunJobWakeGate:
 
         agent_cls.assert_called_once()  # Agent DID wake despite the gate-like text
 
+    def test_invalid_script_config_returns_visible_failure_without_agent(self):
+        """Missing/invalid scripts should fail loudly instead of producing an empty reply."""
+        import cron.scheduler as scheduler
+
+        script_error = "Script not found: /tmp/.hermes/scripts/missing.py"
+        with patch.object(
+            scheduler,
+            "_run_job_script",
+            return_value=(False, script_error),
+        ), patch("run_agent.AIAgent") as agent_cls:
+            success, doc, final, err = scheduler.run_job(self._make_job(script="missing.py"))
+
+        assert success is False
+        assert err == script_error
+        assert script_error in doc
+        assert "Configured script is invalid or missing" in doc
+        assert "Cron job 'wake-gate-test' failed" in final
+        assert script_error in final
+        agent_cls.assert_not_called()
+
     def test_no_script_path_runs_agent_normally(self):
         """Regression: jobs without a script still work."""
         import cron.scheduler as scheduler
