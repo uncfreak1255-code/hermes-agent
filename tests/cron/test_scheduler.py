@@ -2120,9 +2120,50 @@ class TestRunJobWakeGate:
         assert err == script_error
         assert script_error in doc
         assert "Configured script is invalid or missing" in doc
-        assert "Cron job 'wake-gate-test' failed" in final
-        assert script_error in final
+        assert final == (
+            "⚠ Cron job 'wake-gate-test' failed: script "
+            "/tmp/.hermes/scripts/missing.py (not found)"
+        )
         agent_cls.assert_not_called()
+
+    def test_script_failure_alert_uses_last_stderr_line(self, tmp_path):
+        """Formatting should stay short enough for chat alerts on mobile."""
+        import cron.scheduler as scheduler
+
+        with patch.object(scheduler, "_hermes_home", tmp_path):
+            alert = scheduler._format_script_failure_alert(
+                "wake-gate-test",
+                "checks/health.py",
+                "Script exited with code 1\n"
+                "stderr:\n"
+                "Traceback (most recent call last):\n"
+                "Permission denied\n"
+                "stdout:\n"
+                "ignored",
+            )
+
+        assert alert == (
+            f"⚠ Cron job 'wake-gate-test' failed: script "
+            f"{(tmp_path / 'scripts' / 'checks' / 'health.py').resolve()} "
+            "(Permission denied)"
+        )
+
+    def test_script_failure_alert_resolves_escaped_script_path(self, tmp_path):
+        import cron.scheduler as scheduler
+
+        with patch.object(scheduler, "_hermes_home", tmp_path):
+            alert = scheduler._format_script_failure_alert(
+                "wake-gate-test",
+                "../outside.py",
+                f"Blocked: script path resolves outside the scripts directory "
+                f"({(tmp_path / 'scripts').resolve()}): '../outside.py'",
+            )
+
+        assert alert == (
+            f"⚠ Cron job 'wake-gate-test' failed: script "
+            f"{(tmp_path / 'outside.py').resolve()} "
+            "(resolves outside the scripts directory)"
+        )
 
     def test_no_script_path_runs_agent_normally(self):
         """Regression: jobs without a script still work."""

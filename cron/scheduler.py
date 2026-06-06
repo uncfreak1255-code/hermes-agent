@@ -945,6 +945,45 @@ def _is_invalid_script_config_error(script_output: str) -> bool:
     )
 
 
+def _format_script_failure_alert(job_name: str, script_path: str, script_output: str) -> str:
+    """Collapse raw script failures into a compact operator-facing alert."""
+    text = str(script_output or "").strip()
+
+    display_path = str(script_path)
+    for prefix in ("Script not found: ", "Script path is not a file: "):
+        if text.startswith(prefix):
+            display_path = text[len(prefix):].strip()
+            break
+    else:
+        try:
+            raw = Path(script_path).expanduser()
+            if raw.is_absolute():
+                display_path = str(raw.resolve())
+            else:
+                display_path = str((_get_hermes_home() / "scripts" / raw).resolve())
+        except Exception:
+            display_path = str(script_path)
+
+    if text.startswith("Script not found: "):
+        reason = "not found"
+    elif text.startswith("Script path is not a file: "):
+        reason = "not a file"
+    elif text.startswith("Blocked: script path resolves outside the scripts directory"):
+        reason = "resolves outside the scripts directory"
+    else:
+        reason = ""
+        if "stderr:\n" in text:
+            stderr_block = text.split("stderr:\n", 1)[1].split("\nstdout:\n", 1)[0]
+            stderr_lines = [line.strip() for line in stderr_block.splitlines() if line.strip()]
+            if stderr_lines:
+                reason = stderr_lines[-1]
+        if not reason:
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            reason = lines[-1] if lines else "unknown script error"
+
+    return f"⚠ Cron job '{job_name}' failed: script {display_path} ({reason})"
+
+
 def _parse_wake_gate(script_output: str) -> bool:
     """Parse the last non-empty stdout line of a cron job's pre-check script
     as a wake gate.
@@ -1298,9 +1337,8 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         prerun_script = _run_job_script(script_path)
         _ran_ok, _script_output = prerun_script
         if not _ran_ok and _is_invalid_script_config_error(_script_output):
-            visible_failure = (
-                f"⚠️ Cron job '{job_name}' failed:\n"
-                f"{_script_output}"
+            visible_failure = _format_script_failure_alert(
+                job_name, script_path, _script_output
             )
             broken_doc = (
                 f"# Cron Job: {job_name}\n\n"
