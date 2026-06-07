@@ -215,4 +215,3 @@ For monorepos, put subdirectory-specific instructions in nested AGENTS.md files:
 - Run the dev server with `poetry run uvicorn main:app --reload`
 - All endpoints need OpenAPI docstrings
 - Database models are in `models/`, schemas in `schemas/`
-```

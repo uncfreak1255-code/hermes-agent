@@ -115,4 +115,3 @@ FAST = 0.8; NORMAL = 1.5; SLOW = 2.5
 
 ### Subtitle
 "[text]"
-```
