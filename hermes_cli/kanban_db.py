@@ -2209,9 +2209,10 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
       repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
+      ``"gave_up"``, *not* ``"blocked"``.  Dependency-gated tasks may
+      auto-recover later when their parents finally clear, but
+      parentless tasks must stay blocked until a human explicitly
+      retries or unblocks them.
 
     The cheapest signal that distinguishes the two is the most recent
     ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
@@ -2221,8 +2222,8 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 
     Returns ``False`` when there is no such event at all (e.g. the task
     was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
+    DB manipulation) — ``recompute_ready`` then decides whether the task
+    is dependency-gated enough to auto-promote.
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
@@ -2239,14 +2240,13 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
 
-    ``blocked`` tasks are also considered for promotion (so a task
-    blocked purely by a parent dependency unblocks itself when the
-    parent completes), *except* when the most recent block event was a
-    worker-initiated ``kanban_block`` — those stay blocked until an
-    explicit ``kanban_unblock`` (#28712).  Without that guard, a
-    ``review-required`` handoff would auto-respawn, the fresh worker
-    would find nothing to do, exit cleanly, get recorded as a protocol
-    violation, and the cycle would repeat indefinitely.
+    ``blocked`` tasks are only considered for promotion when they are
+    actually dependency-gated (they have at least one parent, and every
+    parent is ``done`` or ``archived``). Parentless breaker-blocked
+    tasks stay blocked until a human unblocks or retries them. Worker-
+    initiated ``kanban_block`` tasks also stay blocked until an explicit
+    ``kanban_unblock`` (#28712). Without those guards, the dispatcher
+    can fall into ``gave_up`` -> ``promoted`` -> respawn loops.
     """
     promoted = 0
     with write_txn(conn):
@@ -2268,6 +2268,11 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
+            if cur_status == "blocked" and not parents:
+                # Parentless tasks do not have a dependency edge that can
+                # flip them back to ready. If the breaker blocked them,
+                # keep them blocked until a human intervenes.
+                continue
             if all(p["status"] in ("done", "archived") for p in parents):
                 # Blocked tasks also get their failure counters reset —
                 # this is effectively an auto-unblock (circuit-breaker
@@ -4151,8 +4156,24 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
 
     ``code`` is the exit status (for ``clean_exit`` / ``nonzero_exit``) or
     the signal number (for ``signaled``), or ``None`` for ``unknown``.
+
+    Late-reap fallback: if the pid is missing from the reap registry on
+    POSIX, try a targeted ``waitpid(pid, WNOHANG)`` once before giving up.
+    This closes the race where a worker exits after the top-of-tick global
+    reap pass but before ``detect_crashed_workers()`` checks liveness. In
+    that window the task is dead, but without the targeted reap we'd only
+    record the generic ``pid N not alive`` and lose the real exit reason.
     """
     entry = _recent_worker_exits.get(int(pid))
+    if entry is None and os.name != "nt":
+        try:
+            reaped_pid, raw = os.waitpid(int(pid), os.WNOHANG)
+        except (ChildProcessError, OSError):
+            reaped_pid = 0
+            raw = 0
+        if reaped_pid == int(pid):
+            _record_worker_exit(reaped_pid, raw)
+            entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
     raw, _ = entry

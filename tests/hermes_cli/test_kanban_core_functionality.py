@@ -1202,6 +1202,37 @@ def test_spawn_failure_circuit_breaker_emits_gave_up(kanban_home, all_assignees_
         conn.close()
 
 
+def test_parentless_gave_up_task_does_not_repromote_on_next_tick(
+    kanban_home, all_assignees_spawnable,
+):
+    def _bad(task, ws):
+        raise RuntimeError("nope")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker", max_retries=1)
+
+        first = kb.dispatch_once(conn, spawn_fn=_bad, failure_limit=5)
+        assert tid in first.auto_blocked
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        second = kb.dispatch_once(conn, spawn_fn=_bad, failure_limit=5)
+        assert tid not in second.auto_blocked
+        assert second.spawned == []
+        assert second.promoted == 0
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+
+        events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert kinds.count("gave_up") == 1
+        assert "promoted" not in kinds
+        assert kinds.count("claimed") == 1
+    finally:
+        conn.close()
+
+
 def test_spawned_event_emitted_with_pid(kanban_home, all_assignees_spawnable):
     """Successful spawn must append a ``spawned`` event with the pid in
     the payload so humans tailing events see pid tracking."""
@@ -4281,6 +4312,60 @@ def test_detect_crashed_workers_protocol_violation_auto_blocks(kanban_home):
         assert "gave_up" in kinds, (
             f"breaker should trip, expected 'gave_up' event, got {kinds}"
         )
+    finally:
+        conn.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="targeted waitpid reap is POSIX-only")
+def test_detect_crashed_workers_late_reap_clean_exit_auto_blocks(
+    kanban_home, monkeypatch
+):
+    """A clean worker exit that happens after the top-of-tick reap pass
+    must still be classified as a protocol violation.
+
+    Regression for the live sawyer loop on June 7, 2026: workers were
+    exiting cleanly on auth errors, but if they died after the dispatch
+    tick's global ``waitpid(-1, WNOHANG)`` sweep and before
+    ``detect_crashed_workers()``, the dispatcher only saw ``pid N not
+    alive``. That lost the clean-exit signal, bypassed the immediate
+    protocol-violation breaker, and let the same auth-broken task
+    respawn forever.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="late-reap-clean-exit", assignee="worker")
+        host_prefix = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
+        fake_pid = 999996
+        kb._set_worker_pid(conn, tid, fake_pid)
+        _kb._recent_worker_exits.pop(fake_pid, None)
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+        def fake_waitpid(pid, options):
+            assert pid == fake_pid
+            assert options == os.WNOHANG
+            # POSIX raw wait status: exited normally with rc=0.
+            return (fake_pid, 0)
+
+        monkeypatch.setattr(_kb.os, "waitpid", fake_waitpid)
+
+        result_crashed = kb.detect_crashed_workers(conn)
+
+        assert tid in result_crashed, "dead worker should still be reclaimed"
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            "late-reaped clean exits should trip the protocol breaker immediately"
+        )
+        assert "kanban_complete" in (task.last_failure_error or "")
+
+        events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "protocol_violation" in kinds
+        assert "crashed" not in kinds
+        assert "gave_up" in kinds
     finally:
         conn.close()
 

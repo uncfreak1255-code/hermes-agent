@@ -23,7 +23,11 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from agent.auxiliary_client import call_llm, _is_connection_error
+from agent.auxiliary_client import (
+    AuxiliaryProviderUnavailableError,
+    call_llm,
+    _is_connection_error,
+)
 from agent.context_engine import ContextEngine
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -473,6 +477,7 @@ class ContextCompressor(ContextEngine):
         self._context_probe_persistable = False
         self._previous_summary = None
         self._last_summary_error = None
+        self._last_summary_provider_unavailable = False
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
         self._last_aux_model_failure_error = None
@@ -537,8 +542,10 @@ class ContextCompressor(ContextEngine):
         self.quiet_mode = quiet_mode
         # When True, summary-generation failure aborts compression entirely
         # (returns messages unchanged, sets _last_compress_aborted=True).
-        # When False (default = historical behavior), insert a static
-        # "summary unavailable" placeholder and drop the middle window.
+        # When False (default = historical behavior), generic summary failures
+        # insert a static "summary unavailable" placeholder and drop the
+        # middle window. Missing auxiliary providers still abort to avoid
+        # silent context loss.
         self.abort_on_summary_failure = abort_on_summary_failure
 
         self.context_length = get_model_context_length(
@@ -587,16 +594,17 @@ class ContextCompressor(ContextEngine):
         self._ineffective_compression_count: int = 0
         self._summary_failure_cooldown_until: float = 0.0
         self._last_summary_error: Optional[str] = None
+        self._last_summary_provider_unavailable: bool = False
         # When summary generation fails and a static fallback is inserted,
         # record how many turns were unrecoverably dropped so callers
         # (gateway hygiene, /compress) can surface a visible warning.
         self._last_summary_dropped_count: int = 0
         self._last_summary_fallback_used: bool = False
-        # When summary generation fails we now ABORT compression entirely
-        # and return the original messages unchanged instead of dropping
-        # the middle window with a static placeholder.  Callers inspect
-        # this flag to know "compression was attempted but aborted, freeze
-        # the chat until the user manually retries via /compress".
+        # Set when compression aborts and returns the original messages
+        # unchanged instead of dropping the middle window. This happens
+        # when abort_on_summary_failure is enabled or when no working
+        # auxiliary summarizer is available. Callers inspect the flag to
+        # surface a visible warning and avoid silent context loss.
         self._last_compress_aborted: bool = False
         # When a user-configured summary model fails and we recover by
         # retrying on the main model, record the failure so gateway /
@@ -1083,14 +1091,17 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             self._summary_model_fallen_back = False
             self._last_summary_error = None
             return self._with_summary_prefix(summary)
-        except RuntimeError:
-            # No provider configured — long cooldown, unlikely to self-resolve
+        except AuxiliaryProviderUnavailableError as e:
+            # No working provider configured — long cooldown, unlikely to self-resolve.
             self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
-            self._last_summary_error = "no auxiliary LLM provider configured"
-            logger.warning("Context compression: no provider available for "
-                            "summary. Middle turns will be dropped without summary "
-                            "for %d seconds.",
-                            _SUMMARY_FAILURE_COOLDOWN_SECONDS)
+            self._last_summary_provider_unavailable = True
+            self._last_summary_error = str(e).strip() or "no auxiliary LLM provider configured"
+            logger.warning(
+                "Context compression: no working auxiliary provider is available "
+                "for summary. Compression will pause without dropping turns for "
+                "%d seconds.",
+                _SUMMARY_FAILURE_COOLDOWN_SECONDS,
+            )
             return None
         except Exception as e:
             # If the summary model is different from the main model and the
@@ -1519,6 +1530,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
         self._last_summary_error = None
+        self._last_summary_provider_unavailable = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         self._last_compress_aborted = False
@@ -1608,23 +1620,33 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         #   True  → ABORT compression entirely. Return messages unchanged
         #           and set _last_compress_aborted=True so callers can warn
         #           the user and stop the auto-compress retry loop.
+        # Missing auxiliary providers also abort even when the config keeps
+        # the legacy fallback path for generic summary failures. Dropping
+        # unsummarized turns because every auxiliary backend vanished is too
+        # risky and too hard for users to notice in time.
         #   False → Fall through to the legacy fallback path below: insert
         #           a static "summary unavailable" placeholder and drop the
         #           middle window.  Records _last_summary_fallback_used /
         #           _last_summary_dropped_count for gateway hygiene to
         #           surface a warning.
         # Default is False (historical behavior).
-        if not summary and self.abort_on_summary_failure:
+        if not summary and (
+            self.abort_on_summary_failure or self._last_summary_provider_unavailable
+        ):
             n_skipped = compress_end - compress_start
             self._last_summary_dropped_count = 0  # nothing actually dropped
             self._last_summary_fallback_used = False
             self._last_compress_aborted = True
             if not self.quiet_mode:
+                if self._last_summary_provider_unavailable:
+                    _reason = "no working auxiliary provider available"
+                else:
+                    _reason = "compression.abort_on_summary_failure=true"
                 logger.warning(
-                    "Summary generation failed — aborting compression "
-                    "(compression.abort_on_summary_failure=true). "
+                    "Summary generation failed — aborting compression (%s). "
                     "%d message(s) preserved unchanged. Conversation is "
                     "frozen until the next /compress or /new.",
+                    _reason,
                     n_skipped,
                 )
             return messages

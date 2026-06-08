@@ -84,21 +84,21 @@ def check_compression_model_feasibility(agent: Any) -> None:
                 msg = (
                     "⚠ Configured auxiliary compression provider "
                     f"'{_aux_cfg_provider}' is unavailable — context "
-                    "compression will drop middle turns without a summary. "
+                    "compression will pause instead of dropping middle turns. "
                     "Check auxiliary.compression in config.yaml and "
                     "reauthenticate that provider."
                 )
             else:
                 msg = (
                     "⚠ No auxiliary LLM provider configured — context "
-                    "compression will drop middle turns without a summary. "
+                    "compression will pause instead of dropping middle turns. "
                     "Run `hermes setup` or set OPENROUTER_API_KEY."
                 )
             agent._compression_warning = msg
             agent._emit_status(msg)
             logger.warning(
                 "No auxiliary LLM provider for compression — "
-                "summaries will be unavailable."
+                "compression will pause rather than dropping turns."
             )
             return
 
