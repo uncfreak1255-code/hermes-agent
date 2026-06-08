@@ -3191,6 +3191,29 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None) -> None
         _save_auth_store(auth_store)
 
 
+def _quarantine_codex_oauth_state(
+    state: Dict[str, Any],
+    error: AuthError,
+    *,
+    reason: str,
+) -> None:
+    """Keep config metadata but remove dead Codex OAuth tokens."""
+    tokens = state.get("tokens")
+    if not isinstance(tokens, dict):
+        tokens = {}
+    tokens.pop("access_token", None)
+    tokens.pop("refresh_token", None)
+    state["tokens"] = tokens
+    state["last_auth_error"] = {
+        "provider": "openai-codex",
+        "code": error.code or "codex_refresh_failed",
+        "message": str(error),
+        "reason": reason,
+        "relogin_required": True,
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def refresh_codex_oauth_pure(
     access_token: str,
     refresh_token: str,
@@ -3249,8 +3272,8 @@ def refresh_codex_oauth_pure(
             message = (
                 "Codex refresh token was already consumed by another client "
                 "(e.g. Codex CLI or VS Code extension). "
-                "Run `codex` in your terminal to generate fresh tokens, "
-                "then run `hermes auth` to re-authenticate."
+                "Run `codex` in your terminal once to mint fresh tokens, "
+                "then run `hermes auth add openai-codex` to reconnect Hermes."
             )
             relogin_required = True
         # A 401/403 from the token endpoint always means the refresh token
@@ -3316,16 +3339,20 @@ def _refresh_codex_auth_tokens(
     return updated_tokens
 
 
+def _codex_cli_auth_path() -> Path:
+    codex_home = os.getenv("CODEX_HOME", "").strip()
+    if not codex_home:
+        codex_home = str(Path.home() / ".codex")
+    return Path(codex_home).expanduser() / "auth.json"
+
+
 def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
     """Try to read tokens from ~/.codex/auth.json (Codex CLI shared file).
     
     Returns tokens dict if valid and not expired, None otherwise.
     Does NOT write to the shared file.
     """
-    codex_home = os.getenv("CODEX_HOME", "").strip()
-    if not codex_home:
-        codex_home = str(Path.home() / ".codex")
-    auth_path = Path(codex_home).expanduser() / "auth.json"
+    auth_path = _codex_cli_auth_path()
     if not auth_path.is_file():
         return None
     try:
@@ -3348,6 +3375,25 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
         return dict(tokens)
     except Exception:
         return None
+
+
+def _try_import_newer_codex_cli_tokens(current_tokens: Dict[str, str]) -> Optional[Dict[str, str]]:
+    """Return newer Codex CLI tokens when they differ from Hermes' copy."""
+    cli_tokens = _import_codex_cli_tokens()
+    if not cli_tokens:
+        return None
+    cli_access = str(cli_tokens.get("access_token", "") or "").strip()
+    cli_refresh = str(cli_tokens.get("refresh_token", "") or "").strip()
+    if not cli_access or not cli_refresh:
+        return None
+    current_access = str(current_tokens.get("access_token", "") or "").strip()
+    current_refresh = str(current_tokens.get("refresh_token", "") or "").strip()
+    if cli_access == current_access and cli_refresh == current_refresh:
+        return None
+    return {
+        "access_token": cli_access,
+        "refresh_token": cli_refresh,
+    }
 
 
 def resolve_codex_runtime_credentials(
@@ -3377,8 +3423,42 @@ def resolve_codex_runtime_credentials(
                 should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
 
             if should_refresh:
-                tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
-                access_token = str(tokens.get("access_token", "") or "").strip()
+                try:
+                    tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
+                    access_token = str(tokens.get("access_token", "") or "").strip()
+                except AuthError as exc:
+                    if not _is_terminal_codex_oauth_refresh_error(exc):
+                        raise
+                    auth_store = _load_auth_store()
+                    state = _load_provider_state(auth_store, "openai-codex") or {}
+                    replacement = _try_import_newer_codex_cli_tokens(tokens)
+                    if replacement is not None:
+                        last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                        state["tokens"] = dict(replacement)
+                        state["last_refresh"] = last_refresh
+                        state["auth_mode"] = "chatgpt"
+                        state.pop("last_auth_error", None)
+                        _save_provider_state(auth_store, "openai-codex", state)
+                        _save_auth_store(auth_store)
+                        tokens = dict(replacement)
+                        access_token = str(tokens.get("access_token", "") or "").strip()
+                        data = {
+                            "tokens": dict(tokens),
+                            "last_refresh": last_refresh,
+                        }
+                        logger.warning(
+                            "Codex refresh token was already consumed elsewhere; imported newer tokens from %s and continued.",
+                            _codex_cli_auth_path(),
+                        )
+                    else:
+                        _quarantine_codex_oauth_state(
+                            state,
+                            exc,
+                            reason="runtime_refresh_failure",
+                        )
+                        _save_provider_state(auth_store, "openai-codex", state)
+                        _save_auth_store(auth_store)
+                        raise
 
     base_url = (
         os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")

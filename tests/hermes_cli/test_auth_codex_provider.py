@@ -125,6 +125,72 @@ def test_resolve_codex_runtime_credentials_force_refresh(tmp_path, monkeypatch):
     assert resolved["api_key"] == "access-forced"
 
 
+def test_resolve_codex_runtime_credentials_imports_newer_cli_tokens_after_reused_refresh(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    expiring_token = _jwt_with_exp(int(time.time()) - 10)
+    _setup_hermes_auth(hermes_home, access_token=expiring_token, refresh_token="refresh-old")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    codex_home = tmp_path / "codex-cli"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "auth.json").write_text(json.dumps({
+        "tokens": {
+            "access_token": "cli-access-new",
+            "refresh_token": "cli-refresh-new",
+        },
+    }))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    def _terminal_refresh_failure(tokens, timeout_seconds):
+        raise AuthError(
+            "Codex refresh token was already consumed by another client",
+            provider="openai-codex",
+            code="refresh_token_reused",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _terminal_refresh_failure)
+
+    resolved = resolve_codex_runtime_credentials()
+
+    assert resolved["api_key"] == "cli-access-new"
+    auth_payload = json.loads((hermes_home / "auth.json").read_text())
+    codex_state = auth_payload["providers"]["openai-codex"]
+    assert codex_state["tokens"]["access_token"] == "cli-access-new"
+    assert codex_state["tokens"]["refresh_token"] == "cli-refresh-new"
+    assert codex_state.get("last_auth_error") is None
+
+
+def test_resolve_codex_runtime_credentials_quarantines_reused_refresh_without_new_cli_tokens(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    expiring_token = _jwt_with_exp(int(time.time()) - 10)
+    _setup_hermes_auth(hermes_home, access_token=expiring_token, refresh_token="refresh-old")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing-codex-cli"))
+
+    def _terminal_refresh_failure(tokens, timeout_seconds):
+        raise AuthError(
+            "Codex refresh token was already consumed by another client",
+            provider="openai-codex",
+            code="refresh_token_reused",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _terminal_refresh_failure)
+
+    with pytest.raises(AuthError) as exc_info:
+        resolve_codex_runtime_credentials()
+
+    assert exc_info.value.code == "refresh_token_reused"
+    auth_payload = json.loads((hermes_home / "auth.json").read_text())
+    codex_state = auth_payload["providers"]["openai-codex"]
+    tokens = codex_state.get("tokens", {})
+    assert not tokens.get("access_token")
+    assert not tokens.get("refresh_token")
+    assert codex_state["last_auth_error"]["reason"] == "runtime_refresh_failure"
+    assert codex_state["last_auth_error"]["relogin_required"] is True
+
+
 def test_resolve_provider_explicit_codex_does_not_fallback(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -253,6 +319,7 @@ def test_refresh_parses_openai_nested_error_shape_refresh_token_reused(monkeypat
     assert err.relogin_required is True
     # The existing dedicated branch should override the message with actionable guidance.
     assert "already consumed by another client" in str(err)
+    assert "hermes auth add openai-codex" in str(err)
 
 
 def test_refresh_parses_openai_nested_error_shape_generic_code(monkeypatch):

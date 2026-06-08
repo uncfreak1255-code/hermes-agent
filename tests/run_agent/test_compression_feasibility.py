@@ -303,6 +303,7 @@ def test_warns_when_no_auxiliary_provider(mock_get_client):
 
     assert len(messages) == 1
     assert "No auxiliary LLM provider" in messages[0]
+    assert "pause instead of dropping middle turns" in messages[0]
     assert agent._compression_warning is not None
 
 
