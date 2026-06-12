@@ -107,6 +107,10 @@ from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_
 logger = logging.getLogger(__name__)
 
 
+class AuxiliaryProviderUnavailableError(RuntimeError):
+    """Raised when no working auxiliary provider can be resolved."""
+
+
 def _safe_isinstance(obj: Any, maybe_type: Any) -> bool:
     """Return False instead of raising when a patched symbol is not a type."""
     try:
@@ -4824,7 +4828,7 @@ def call_llm(
                 async_mode=False,
             )
         if client is None:
-            raise RuntimeError(
+            raise AuxiliaryProviderUnavailableError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup"
             )
@@ -4844,7 +4848,7 @@ def call_llm(
             # through OpenRouter (which causes confusing 404s).
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
-                raise RuntimeError(
+                raise AuxiliaryProviderUnavailableError(
                     f"Provider '{_explicit}' is set in config.yaml but no API key "
                     f"was found. Set the {_explicit.upper()}_API_KEY environment "
                     f"variable, or switch to a different provider with `hermes model`."
@@ -4859,7 +4863,7 @@ def call_llm(
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client("auto", main_runtime=main_runtime)
         if client is None:
-            raise RuntimeError(
+            raise AuxiliaryProviderUnavailableError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
@@ -5247,7 +5251,7 @@ async def async_call_llm(
                 async_mode=True,
             )
         if client is None:
-            raise RuntimeError(
+            raise AuxiliaryProviderUnavailableError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup"
             )
@@ -5264,7 +5268,7 @@ async def async_call_llm(
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
-                raise RuntimeError(
+                raise AuxiliaryProviderUnavailableError(
                     f"Provider '{_explicit}' is set in config.yaml but no API key "
                     f"was found. Set the {_explicit.upper()}_API_KEY environment "
                     f"variable, or switch to a different provider with `hermes model`."
@@ -5274,7 +5278,7 @@ async def async_call_llm(
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client("auto", async_mode=True)
         if client is None:
-            raise RuntimeError(
+            raise AuxiliaryProviderUnavailableError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 

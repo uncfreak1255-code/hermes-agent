@@ -294,6 +294,31 @@ def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
         assert task.last_failure_error is None
 
 
+def test_recompute_ready_keeps_parentless_blocked_task_blocked(kanban_home):
+    """Parentless breaker-blocked tasks must not auto-promote."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="child", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET status='blocked', consecutive_failures=2, "
+            "last_failure_error='persistent error' WHERE id=?",
+            (task_id,),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'gave_up', NULL, ?)",
+            (task_id, 1),
+        )
+        conn.commit()
+
+        promoted = kb.recompute_ready(conn)
+
+        assert promoted == 0
+        task = kb.get_task(conn, task_id)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 2
+        assert task.last_failure_error == "persistent error"
+
+
 def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
     with kb.connect() as conn:
         a = kb.create_task(conn, title="a")
@@ -3338,4 +3363,3 @@ def test_maybe_emit_scratch_tip_skips_non_scratch_workspaces(kanban_home, caplog
                 "SELECT kind FROM task_events WHERE task_id = ?", (tid,),
             ).fetchall()
             assert "tip_scratch_workspace" not in [e["kind"] for e in events]
-

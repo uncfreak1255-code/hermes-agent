@@ -4,6 +4,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX
+from agent.auxiliary_client import AuxiliaryProviderUnavailableError
 
 
 @pytest.fixture()
@@ -64,11 +65,11 @@ class TestCompress:
         result = compressor.compress(msgs)
         assert result == msgs
 
-    def test_truncation_fallback_no_client(self, compressor):
-        # Simulate "no summarizer available" explicitly. call_llm can otherwise
-        # discover the developer's real auxiliary credentials from auth state.
+    def test_truncation_fallback_on_generic_runtime_error(self, compressor):
+        # Generic runtime failures still take the legacy fallback path when
+        # abort_on_summary_failure is disabled.
         msgs = [{"role": "system", "content": "System prompt"}] + self._make_messages(10)
-        with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
+        with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("summarizer crashed")):
             result = compressor.compress(msgs)
         assert len(result) < len(msgs)
         # Should keep system message and last N
@@ -78,13 +79,32 @@ class TestCompress:
         assert compressor._last_compress_aborted is False
         assert compressor._last_summary_fallback_used is True
 
+    def test_no_provider_aborts_without_dropping_messages(self, compressor):
+        msgs = [{"role": "system", "content": "System prompt"}] + self._make_messages(10)
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=AuxiliaryProviderUnavailableError(
+                "No LLM provider configured for task=compression provider=auto. Run: hermes setup"
+            ),
+        ):
+            result = compressor.compress(msgs)
+
+        assert result == msgs
+        assert compressor._last_compress_aborted is True
+        assert compressor._last_summary_fallback_used is False
+        assert compressor._last_summary_dropped_count == 0
+        assert compressor._last_summary_provider_unavailable is True
+        assert "No LLM provider configured" in compressor._last_summary_error
+
     def test_compression_increments_count(self, compressor):
         msgs = self._make_messages(10)
         # Default config (abort_on_summary_failure=False) — fallback path
         # increments the count even on summary failure.
-        compressor.compress(msgs)
+        with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("summarizer crashed")):
+            compressor.compress(msgs)
         assert compressor.compression_count == 1
-        compressor.compress(msgs)
+        with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("summarizer crashed")):
+            compressor.compress(msgs)
         assert compressor.compression_count == 2
 
     def test_protects_first_and_last(self, compressor):
@@ -135,7 +155,11 @@ class TestGenerateSummaryNoneContent:
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
             for i in range(10)
         ]
-        result = c.compress(msgs)
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
         assert len(result) < len(msgs)
 
 
@@ -1431,7 +1455,11 @@ class TestSummaryTargetRatio:
             + [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
                for i in range(8)]
         )
-        result = c.compress(msgs)
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
         # System prompt (msg[0]) survives as head
         assert result[0]["role"] == "system"
         assert result[0]["content"].startswith("System prompt")

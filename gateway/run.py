@@ -1078,11 +1078,17 @@ def _resolve_runtime_agent_kwargs() -> dict:
         resolve_runtime_provider,
         format_runtime_provider_error,
     )
-    from hermes_cli.auth import AuthError
+    from hermes_cli.auth import AuthError, _is_terminal_codex_oauth_refresh_error
 
     try:
         runtime = resolve_runtime_provider()
     except AuthError as auth_exc:
+        if _is_terminal_codex_oauth_refresh_error(auth_exc):
+            logger.warning(
+                "Primary provider auth failed: %s - not trying fallback",
+                auth_exc,
+            )
+            raise RuntimeError(str(auth_exc)) from auth_exc
         # Primary provider auth failed (expired token, revoked key, etc.).
         # Try the fallback provider chain before raising.
         logger.warning("Primary provider auth failed: %s — trying fallback", auth_exc)
