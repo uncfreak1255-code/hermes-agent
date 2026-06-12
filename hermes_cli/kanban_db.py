@@ -2234,19 +2234,30 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _has_parentless_breaker_block(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when a parentless task is still parked by the breaker."""
+    row = conn.execute(
+        "SELECT kind FROM task_events "
+        "WHERE task_id = ? AND kind IN ('gave_up', 'unblocked') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return bool(row) and row["kind"] == "gave_up"
+
+
 def recompute_ready(conn: sqlite3.Connection) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
 
-    ``blocked`` tasks are only considered for promotion when they are
-    actually dependency-gated (they have at least one parent, and every
-    parent is ``done`` or ``archived``). Parentless breaker-blocked
-    tasks stay blocked until a human unblocks or retries them. Worker-
-    initiated ``kanban_block`` tasks also stay blocked until an explicit
-    ``kanban_unblock`` (#28712). Without those guards, the dispatcher
-    can fall into ``gave_up`` -> ``promoted`` -> respawn loops.
+    ``blocked`` dependency-gated tasks recover when every parent is
+    ``done`` or ``archived``. Parentless tasks parked by a current
+    ``gave_up`` breaker event stay blocked until a human unblocks or
+    retries them. Worker-initiated ``kanban_block`` tasks also stay
+    blocked until an explicit ``kanban_unblock`` (#28712). Without those
+    guards, the dispatcher can fall into ``gave_up`` -> ``promoted`` ->
+    respawn loops.
     """
     promoted = 0
     with write_txn(conn):
@@ -2268,10 +2279,14 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if cur_status == "blocked" and not parents:
+            if (
+                cur_status == "blocked"
+                and not parents
+                and _has_parentless_breaker_block(conn, task_id)
+            ):
                 # Parentless tasks do not have a dependency edge that can
-                # flip them back to ready. If the breaker blocked them,
-                # keep them blocked until a human intervenes.
+                # flip them back to ready. If the latest breaker state is
+                # still gave_up, keep them blocked until a human intervenes.
                 continue
             if all(p["status"] in ("done", "archived") for p in parents):
                 # Blocked tasks also get their failure counters reset —

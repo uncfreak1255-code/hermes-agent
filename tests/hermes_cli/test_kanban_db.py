@@ -303,6 +303,11 @@ def test_recompute_ready_keeps_parentless_blocked_task_blocked(kanban_home):
             "last_failure_error='persistent error' WHERE id=?",
             (task_id,),
         )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'gave_up', NULL, ?)",
+            (task_id, 1),
+        )
         conn.commit()
 
         promoted = kb.recompute_ready(conn)
