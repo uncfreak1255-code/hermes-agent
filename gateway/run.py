@@ -4194,6 +4194,24 @@ class GatewayRunner:
                 )
                 continue
 
+            try:
+                has_history = bool(
+                    self.session_store.has_meaningful_transcript(entry.session_id)
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Could not inspect transcript before auto-resume for %s: %s",
+                    entry.session_key,
+                    exc,
+                )
+                has_history = True
+            if not has_history:
+                logger.debug(
+                    "Skipping auto-resume for %s: transcript has no meaningful content",
+                    entry.session_key,
+                )
+                continue
+
             # Empty-text internal event — the _is_resume_pending branch in
             # _handle_message_with_agent prepends the proper reason-aware
             # system note before the turn runs.
