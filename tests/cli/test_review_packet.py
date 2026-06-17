@@ -25,6 +25,45 @@ def _make_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _make_repo_with_upstream_drift(tmp_path: Path) -> Path:
+    upstream = tmp_path / "upstream.git"
+    _git(tmp_path, "init", "--bare", str(upstream))
+
+    seed = tmp_path / "seed"
+    _git(tmp_path, "clone", str(upstream), str(seed))
+    _git(seed, "config", "user.name", "Test User")
+    _git(seed, "config", "user.email", "test@example.com")
+    _git(seed, "checkout", "-b", "main")
+    (seed / "app.py").write_text("def greet():\n    return 'hello'\n", encoding="utf-8")
+    _git(seed, "add", "app.py")
+    _git(seed, "commit", "-qm", "init")
+    _git(seed, "push", "-u", "origin", "main")
+    _git(tmp_path, "--git-dir", str(upstream), "symbolic-ref", "HEAD", "refs/heads/main")
+
+    repo = tmp_path / "repo"
+    _git(tmp_path, "clone", str(upstream), str(repo))
+    _git(repo, "config", "user.name", "Test User")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "remote", "rename", "origin", "upstream")
+    _git(repo, "branch", "--set-upstream-to=upstream/main", "main")
+
+    (repo / "app.py").write_text("def greet():\n    return 'hello local'\n", encoding="utf-8")
+    _git(repo, "add", "app.py")
+    _git(repo, "commit", "-qm", "local change")
+
+    other = tmp_path / "other"
+    _git(tmp_path, "clone", str(upstream), str(other))
+    _git(other, "config", "user.name", "Other User")
+    _git(other, "config", "user.email", "other@example.com")
+    (other / "README.md").write_text("# Remote drift\n", encoding="utf-8")
+    _git(other, "add", "README.md")
+    _git(other, "commit", "-qm", "remote change")
+    _git(other, "push", "origin", "main")
+
+    _git(repo, "fetch", "upstream")
+    return repo
+
+
 def test_review_packet_puts_test_edits_first_and_needs_merge_after_evidence(tmp_path):
     from hermes_cli.review_packet import build_review_receipt
 
@@ -111,6 +150,28 @@ def test_review_packet_does_not_flag_section_rules_as_conflict_markers(tmp_path)
 
     assert receipt["merge_confidence"]["checks"]["conflict_markers"] is False
     assert receipt["merge_confidence"]["recommendation"] == "needs merge"
+
+
+def test_review_packet_calls_out_protected_main_and_exact_upstream_drift(tmp_path):
+    from hermes_cli.review_packet import build_review_receipt
+
+    repo = _make_repo_with_upstream_drift(tmp_path)
+    receipt = build_review_receipt(
+        repo,
+        base_ref="HEAD~1",
+        tests_run=["pytest tests/cli/test_review_packet.py"],
+    )
+
+    checks = receipt["merge_confidence"]["checks"]
+    assert checks["protected_branch"] is True
+    assert checks["branch_name"] == "main"
+    assert checks["upstream"] == "upstream/main"
+    assert checks["ahead_count"] == 1
+    assert checks["behind_count"] == 1
+    assert receipt["merge_confidence"]["recommendation"] == "hold"
+    assert "Upstream drift vs upstream/main: ahead 1, behind 1." in receipt["merge_confidence"]["reasons"]
+    assert "Protected branch checked out: main." in receipt["packet"]["risk_notes"]
+    assert "Upstream drift vs upstream/main: ahead 1, behind 1." in receipt["packet"]["risk_notes"]
 
 
 def test_review_packet_cli_emits_json_receipt(tmp_path):

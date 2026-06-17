@@ -513,6 +513,46 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--review-packet",
+        action="store_true",
+        help="Build and attach a review packet for this single-task closeout",
+    )
+    p_complete.add_argument(
+        "--review-path",
+        default=".",
+        help="Path inside the git repo to inspect for --review-packet (default: current directory)",
+    )
+    p_complete.add_argument(
+        "--review-base",
+        default=None,
+        help="Git base ref/revspec for --review-packet (default: HEAD)",
+    )
+    p_complete.add_argument(
+        "--review-intent",
+        default=None,
+        help="Plain-language intent for --review-packet (defaults to --summary, then --result)",
+    )
+    p_complete.add_argument(
+        "--review-test",
+        action="append",
+        default=[],
+        dest="review_tests_run",
+        help="Test evidence line for --review-packet (repeatable)",
+    )
+    p_complete.add_argument(
+        "--review-evidence",
+        action="append",
+        default=[],
+        help="Additional evidence line for --review-packet (repeatable)",
+    )
+    p_complete.add_argument(
+        "--review-ai-finding",
+        action="append",
+        default=[],
+        dest="review_ai_findings",
+        help="AI finding for --review-packet (repeatable)",
+    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -1864,12 +1904,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return 1
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
+    want_review_packet = bool(getattr(args, "review_packet", False))
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
     # Refuse instead of silently doing the wrong thing.
-    if len(ids) > 1 and (summary or raw_meta):
+    if len(ids) > 1 and (summary or raw_meta or want_review_packet):
         print(
-            "kanban: --summary / --metadata are per-task and can't be used "
+            "kanban: --summary / --metadata / --review-packet are per-task and can't be used "
             "with multiple ids (would apply the same handoff to every task). "
             "Complete tasks one at a time, or drop the flags for the bulk close.",
             file=sys.stderr,
@@ -1884,6 +1925,27 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
+    review_receipt = None
+    formatted_review_receipt = ""
+    if want_review_packet:
+        from hermes_cli.review_packet import build_review_receipt, format_review_receipt
+
+        review_receipt = build_review_receipt(
+            getattr(args, "review_path", "."),
+            base_ref=getattr(args, "review_base", None),
+            intent=(
+                getattr(args, "review_intent", None)
+                or summary
+                or args.result
+                or f"Close out task {ids[0]}."
+            ),
+            tests_run=list(getattr(args, "review_tests_run", []) or []),
+            evidence=list(getattr(args, "review_evidence", []) or []),
+            ai_findings=list(getattr(args, "review_ai_findings", []) or []),
+        )
+        metadata = dict(metadata or {})
+        metadata["review_packet"] = review_receipt
+        formatted_review_receipt = format_review_receipt(review_receipt)
     failed: list[str] = []
     with kb.connect() as conn:
         for tid in ids:
@@ -1898,6 +1960,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
+                if formatted_review_receipt:
+                    print()
+                    print(formatted_review_receipt, end="")
     return 0 if not failed else 1
 
 

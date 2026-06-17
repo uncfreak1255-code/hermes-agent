@@ -42,6 +42,9 @@ class ReviewPacketError(RuntimeError):
     """Raised when the review packet cannot be built."""
 
 
+_PROTECTED_BRANCHES = {"main", "master", "trunk"}
+
+
 def _run_git(repo: Path, args: list[str], *, timeout: int = _DEFAULT_TIMEOUT_SECONDS) -> str:
     try:
         completed = subprocess.run(
@@ -170,11 +173,38 @@ def _hunk_lines(diff_output: str) -> dict[str, int]:
     return lines
 
 
-def _status_summary(status_output: str) -> tuple[bool, bool, str]:
+def _branch_details(repo: Path) -> dict[str, object]:
+    branch_name = ""
+    upstream = ""
+    ahead = 0
+    behind = 0
+    raw = _run_git(repo, ["status", "--porcelain=v2", "--branch"])
+    for line in raw.splitlines():
+        if line.startswith("# branch.head "):
+            branch_name = line.removeprefix("# branch.head ").strip()
+        elif line.startswith("# branch.upstream "):
+            upstream = line.removeprefix("# branch.upstream ").strip()
+        elif line.startswith("# branch.ab "):
+            match = re.search(r"\+(\d+)\s+-(\d+)", line)
+            if match:
+                ahead = int(match.group(1))
+                behind = int(match.group(2))
+
+    protected = branch_name in _PROTECTED_BRANCHES
+    return {
+        "branch": branch_name,
+        "upstream": upstream,
+        "ahead": ahead,
+        "behind": behind,
+        "protected": protected,
+    }
+
+
+def _status_summary(status_output: str, branch_details: dict[str, object]) -> tuple[bool, bool, str]:
     lines = status_output.splitlines()
     branch_line = lines[0] if lines else ""
     dirty = any(line and not line.startswith("## ") for line in lines)
-    stale = "behind " in branch_line
+    stale = bool(branch_details.get("behind", 0))
     return dirty, stale, branch_line
 
 
@@ -230,7 +260,12 @@ def _file_entries(repo: Path, base_ref: str | None, status_output: str) -> list[
     return sorted(entries, key=lambda item: (not item["is_test"], item["path"]))
 
 
-def _risk_notes(files: list[dict], dirty: bool, stale: bool) -> list[str]:
+def _risk_notes(
+    files: list[dict],
+    dirty: bool,
+    stale: bool,
+    branch_details: dict[str, object],
+) -> list[str]:
     notes: list[str] = []
     high_risk = [item["path"] for item in files if item["risk"] == "high"]
     if high_risk:
@@ -239,7 +274,17 @@ def _risk_notes(files: list[dict], dirty: bool, stale: bool) -> list[str]:
         dirty_paths = [item["path"] for item in files]
         detail = ", ".join(dirty_paths) if dirty_paths else "local changes"
         notes.append(f"Dirty worktree: {detail}")
-    if stale:
+    branch_name = str(branch_details.get("branch") or "")
+    if branch_details.get("protected"):
+        notes.append(f"Protected branch checked out: {branch_name}.")
+    upstream = str(branch_details.get("upstream") or "")
+    ahead = int(branch_details.get("ahead", 0) or 0)
+    behind = int(branch_details.get("behind", 0) or 0)
+    if upstream:
+        notes.append(
+            f"Upstream drift vs {upstream}: ahead {ahead}, behind {behind}."
+        )
+    elif stale:
         notes.append("Branch is behind its upstream; refresh before merge.")
     code_without_tests = [
         item["path"]
@@ -303,6 +348,7 @@ def _recommendation(
     conflict_markers: bool,
     ai_findings: list[str],
     files: list[dict],
+    branch_details: dict[str, object],
 ) -> tuple[str, list[str]]:
     reasons: list[str] = []
     if not has_changes:
@@ -311,7 +357,10 @@ def _recommendation(
         dirty_paths = [item["path"] for item in files]
         reasons.append("Dirty worktree: " + (", ".join(dirty_paths) or "local changes"))
     if stale:
-        reasons.append("Branch is behind upstream.")
+        upstream = str(branch_details.get("upstream") or "its upstream")
+        ahead = int(branch_details.get("ahead", 0) or 0)
+        behind = int(branch_details.get("behind", 0) or 0)
+        reasons.append(f"Upstream drift vs {upstream}: ahead {ahead}, behind {behind}.")
     if conflict_markers:
         reasons.append("Conflict markers were found in changed files.")
     if ai_findings:
@@ -337,7 +386,8 @@ def build_review_receipt(
 
     repo = _repo_root(path)
     status_output = _run_git(repo, ["status", "--short", "--branch"])
-    dirty, stale, branch_line = _status_summary(status_output)
+    branch_details = _branch_details(repo)
+    dirty, stale, branch_line = _status_summary(status_output, branch_details)
     files = _file_entries(repo, base_ref, status_output)
     paths = [item["path"] for item in files]
     diff_output = _run_git(repo, ["diff", "--unified=0", *_diff_args(base_ref)])
@@ -357,6 +407,7 @@ def build_review_receipt(
         conflict_markers=conflict_markers,
         ai_findings=findings,
         files=files,
+        branch_details=branch_details,
     )
 
     packet = {
@@ -370,7 +421,7 @@ def build_review_receipt(
         "tests_run": tests,
         "evidence": evidence_items,
         "test_edits": [item for item in files if item["is_test"]],
-        "risk_notes": _risk_notes(files, dirty, stale),
+        "risk_notes": _risk_notes(files, dirty, stale, branch_details),
         "human_must_inspect": _human_inspect(files, hunk_lines),
     }
 
@@ -388,6 +439,11 @@ def build_review_receipt(
                 "tests_present": bool(tests or evidence_items),
                 "dirty_worktree": dirty,
                 "stale_worktree": stale,
+                "protected_branch": bool(branch_details.get("protected")),
+                "branch_name": branch_details.get("branch") or "",
+                "upstream": branch_details.get("upstream") or "",
+                "ahead_count": int(branch_details.get("ahead", 0) or 0),
+                "behind_count": int(branch_details.get("behind", 0) or 0),
                 "conflict_markers": conflict_markers,
                 "ai_findings_count": len(findings),
             },
@@ -395,6 +451,11 @@ def build_review_receipt(
                 "status": branch_line,
                 "dirty": dirty,
                 "stale": stale,
+                "branch": branch_details.get("branch") or "",
+                "upstream": branch_details.get("upstream") or "",
+                "ahead": int(branch_details.get("ahead", 0) or 0),
+                "behind": int(branch_details.get("behind", 0) or 0),
+                "protected": bool(branch_details.get("protected")),
             },
             "ai_review": {
                 "status": "findings_provided" if findings else "placeholder_no_ai_findings",
@@ -415,6 +476,20 @@ def format_review_receipt(receipt: dict) -> str:
         f"Intent: {packet['intent']}",
         f"Risk: {packet['blast_radius']['risk_tier']} ({packet['blast_radius']['files_changed']} file(s))",
         f"Recommendation: {confidence['recommendation']}",
+        "",
+        "Worktree state:",
+        (
+            f"- branch {confidence['worktree_state']['branch'] or '(detached)'}"
+            + (" (protected)" if confidence["worktree_state"]["protected"] else "")
+        ),
+        (
+            f"- upstream {confidence['worktree_state']['upstream']}: "
+            f"ahead {confidence['worktree_state']['ahead']}, "
+            f"behind {confidence['worktree_state']['behind']}"
+            if confidence["worktree_state"]["upstream"]
+            else "- upstream not configured"
+        ),
+        f"- status {confidence['worktree_state']['status']}",
         "",
         "Files changed:",
     ]

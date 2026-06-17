@@ -1808,6 +1808,42 @@ def test_cli_complete_with_summary_and_metadata(kanban_home):
     assert r.metadata == {"files": 3}
 
 
+def test_cli_complete_can_attach_review_packet_to_closeout(kanban_home, monkeypatch):
+    from hermes_cli import review_packet
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+
+    fake_receipt = {
+        "packet": {"intent": "done it", "files_changed": []},
+        "merge_confidence": {"recommendation": "hold"},
+    }
+    monkeypatch.setattr(review_packet, "build_review_receipt", lambda *a, **k: fake_receipt)
+    monkeypatch.setattr(review_packet, "format_review_receipt", lambda receipt: "REVIEW PACKET\n")
+
+    out = run_slash(
+        "complete " + tid
+        + " --summary \"done it\""
+        + " --metadata '{\"files\": 3}'"
+        + " --review-packet"
+        + " --review-path ."
+        + " --review-test \"pytest tests/cli/test_review_packet.py\""
+    )
+
+    assert "Completed" in out
+    assert "REVIEW PACKET" in out
+    conn = kb.connect()
+    try:
+        r = kb.latest_run(conn, tid)
+    finally:
+        conn.close()
+    assert r.metadata == {"files": 3, "review_packet": fake_receipt}
+
+
 def test_cli_edit_backfills_result_on_done_task(kanban_home):
     conn = kb.connect()
     try:
