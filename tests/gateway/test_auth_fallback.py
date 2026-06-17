@@ -1,7 +1,6 @@
 """Test that AuthError triggers fallback provider resolution (#7230)."""
 
-import os
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 
@@ -71,6 +70,44 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
             from gateway.run import _resolve_runtime_agent_kwargs
             with pytest.raises(RuntimeError):
                 _resolve_runtime_agent_kwargs()
+
+    def test_terminal_codex_auth_error_skips_fallback(self, tmp_path, monkeypatch, caplog):
+        """Reused Codex refresh tokens should surface recovery steps, not a silent provider swap."""
+        from hermes_cli.auth import AuthError
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "model:\n  provider: openai-codex\n"
+            "fallback_model:\n  provider: openrouter\n"
+            "  model: meta-llama/llama-4-maverick\n"
+        )
+
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+
+        err = AuthError(
+            "Codex refresh token was already consumed by another client. "
+            "Run `codex` in your terminal once to mint fresh tokens, "
+            "then run `hermes auth add openai-codex` to reconnect Hermes.",
+            provider="openai-codex",
+            code="refresh_token_reused",
+            relogin_required=True,
+        )
+
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=err,
+        ), patch(
+            "gateway.run._try_resolve_fallback_provider",
+            side_effect=AssertionError("terminal Codex auth error should not try fallback"),
+        ):
+            from gateway.run import _resolve_runtime_agent_kwargs
+
+            with caplog.at_level("WARNING"):
+                with pytest.raises(RuntimeError) as exc_info:
+                    _resolve_runtime_agent_kwargs()
+
+        assert "already consumed by another client" in str(exc_info.value)
+        assert "not trying fallback" in caplog.text
 
     def test_legacy_fallback_is_appended_after_fallback_providers(self, tmp_path, monkeypatch):
         """When both keys exist, the legacy entry still participates in resolution."""
