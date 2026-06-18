@@ -63,6 +63,7 @@ AUTHOR_MAP = {
     "524706+Twanislas@users.noreply.github.com": "Twanislas",
     "9592417+adam91holt@users.noreply.github.com": "adam91holt",
     "sawyerbeck25@gmail.com": "uncfreak1255-code",
+    "sawbeck@Mac-Studio.local": "uncfreak1255-code",
     "kchuang1015@users.noreply.github.com": "kchuang1015",
     "45688690+fujinice@users.noreply.github.com": "fujinice",
     "276689385+carltonawong@users.noreply.github.com": "carltonawong",

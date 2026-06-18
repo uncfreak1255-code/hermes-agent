@@ -11463,7 +11463,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
         "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
         "prompt-size",
-        "send", "sessions", "setup",
+        "review-packet", "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
@@ -12917,6 +12917,81 @@ def main():
         help="Show redacted API key prefixes (first/last 4 chars) instead of just set/not set",
     )
     dump_parser.set_defaults(func=cmd_dump)
+
+    # =========================================================================
+    # review-packet command
+    # =========================================================================
+    review_packet_parser = subparsers.add_parser(
+        "review-packet",
+        help="Build a git review packet and merge-confidence receipt",
+        description=(
+            "Inspect a git worktree or diff and print a phone-readable review "
+            "packet plus a deterministic merge-confidence receipt."
+        ),
+    )
+    review_packet_parser.add_argument(
+        "--path",
+        default=".",
+        help="Path inside the target git repository (default: current directory)",
+    )
+    review_packet_parser.add_argument(
+        "--base",
+        default=None,
+        help="Git base ref/revspec to compare against (default: HEAD)",
+    )
+    review_packet_parser.add_argument(
+        "--intent",
+        default="",
+        help="Plain-language intent for the change",
+    )
+    review_packet_parser.add_argument(
+        "--test",
+        action="append",
+        default=[],
+        dest="tests_run",
+        help="Test command or test evidence line (repeatable)",
+    )
+    review_packet_parser.add_argument(
+        "--evidence",
+        action="append",
+        default=[],
+        help="Additional evidence line (repeatable)",
+    )
+    review_packet_parser.add_argument(
+        "--ai-finding",
+        action="append",
+        default=[],
+        dest="ai_findings",
+        help="AI review finding/sensor input to include in the gate (repeatable)",
+    )
+    review_packet_parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format (default: text)",
+    )
+
+    def cmd_review_packet(args):
+        from hermes_cli.review_packet import (
+            build_review_receipt,
+            format_review_receipt,
+            receipt_to_json,
+        )
+
+        receipt = build_review_receipt(
+            args.path,
+            base_ref=args.base,
+            intent=args.intent,
+            tests_run=args.tests_run,
+            evidence=args.evidence,
+            ai_findings=args.ai_findings,
+        )
+        if args.format == "json":
+            print(receipt_to_json(receipt), end="")
+        else:
+            print(format_review_receipt(receipt), end="")
+
+    review_packet_parser.set_defaults(func=cmd_review_packet)
 
     # =========================================================================
     # debug command
