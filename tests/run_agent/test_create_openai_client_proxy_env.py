@@ -34,6 +34,7 @@ def _make_agent():
         quiet_mode=True,
         skip_context_files=True,
         skip_memory=True,
+        enabled_toolsets=[],
     )
 
 
